@@ -1,0 +1,14 @@
+.env
+*.env
+.env.*
+local.properties
+.gradle/
+build/
+app/build/
+.idea/
+*.iml
+*.jks
+*.keystore
+google-services.json
+.DS_Store
+Thumbs.db

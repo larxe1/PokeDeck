@@ -27,6 +27,11 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.material3.Button
+import androidx.compose.material3.Slider
+import java.util.UUID
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -95,8 +100,15 @@ import com.pogooverlay.app.core.data.PokemonType
 import com.pogooverlay.app.core.data.RaidBossEntry
 import com.pogooverlay.app.core.data.ScanMode
 import com.pogooverlay.app.core.data.TypeEffectivenessChart
+import com.pogooverlay.app.core.detector.DetectedOwnPokemon
+import com.pogooverlay.app.core.detector.MyPokemonDetector
 import com.pogooverlay.app.core.detector.RaidBossDetector
 import com.pogooverlay.app.core.ocr.OcrPipeline
+import com.pogooverlay.app.core.pokebox.MoveData
+import com.pogooverlay.app.core.pokebox.PokeboxRepository
+import com.pogooverlay.app.core.pokebox.PokemonMathEngine
+import com.pogooverlay.app.core.pokebox.RaidBattleSimulator
+import com.pogooverlay.app.core.pokebox.SavedPokemon
 import com.pogooverlay.app.ui.MainActivity
 import com.pogooverlay.app.ui.components.PokemonSprite
 import com.pogooverlay.app.ui.components.TypeChip
@@ -104,6 +116,7 @@ import com.pogooverlay.app.ui.components.TypeDot
 import com.pogooverlay.app.ui.components.WeaknessPriorityStrip
 import com.pogooverlay.app.ui.components.badgeColor
 import com.pogooverlay.app.ui.components.contentColor
+import com.pogooverlay.app.ui.pokebox.formatLevel
 import com.pogooverlay.app.ui.theme.PoGoOverlayTheme
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -160,9 +173,11 @@ class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
     private lateinit var repository: PokemonRepository
+    private lateinit var pokeboxRepository: PokeboxRepository
     private lateinit var captureEngine: ScreenCaptureEngine
     private lateinit var ocrPipeline: OcrPipeline
     private lateinit var raidBossDetector: RaidBossDetector
+    private lateinit var myPokemonDetector: MyPokemonDetector
 
     private var pillLifecycleOwner: OverlayLifecycleOwner? = null
     private var bannerLifecycleOwner: OverlayLifecycleOwner? = null
@@ -217,6 +232,12 @@ class OverlayService : Service() {
             PokemonRepository(applicationContext)
         }
         repository.ensureLoaded()
+        pokeboxRepository = try {
+            PoGoOverlayApp.instance.pokeboxRepository
+        } catch (_: Throwable) {
+            PokeboxRepository(applicationContext)
+        }
+        pokeboxRepository.ensureLoaded()
 
         isScreenOn = queryIsScreenInteractive()
 
@@ -237,6 +258,11 @@ class OverlayService : Service() {
         ocrPipeline = OcrPipeline()
         raidBossDetector = RaidBossDetector(
             matcherProvider = { repository.getMatcher() },
+            activeRaidsProvider = { repository.activeRaids.value }
+        )
+        myPokemonDetector = MyPokemonDetector(
+            matcherProvider = { repository.getMatcher() },
+            movesProvider = { pokeboxRepository.movesById.value },
             activeRaidsProvider = { repository.activeRaids.value }
         )
 
@@ -463,10 +489,17 @@ class OverlayService : Service() {
             setContent {
                 PoGoOverlayTheme {
                     val runtimeState by OverlayStateHolder.state.collectAsState()
+                    val savedPokemon by pokeboxRepository.savedPokemon.collectAsState()
+                    val movesById by pokeboxRepository.movesById.collectAsState()
+                    val allSpecies by repository.species.collectAsState()
+                    val speciesById = remember(allSpecies) { allSpecies.associateBy { it.speciesId } }
                     val banner = runtimeState.activeBanner
                     if (banner != null) {
                         PriorityWeaknessBannerOverlay(
                             banner = banner,
+                            savedPokemon = savedPokemon,
+                            speciesById = speciesById,
+                            movesById = movesById,
                             onSelectForm = { selectedForm ->
                                 OverlayStateHolder.selectForm(
                                     species = selectedForm,
@@ -529,15 +562,35 @@ class OverlayService : Service() {
             setContent {
                 PoGoOverlayTheme {
                     val drawerOpen by isDrawerOpen.collectAsState()
+                    val runtimeState by OverlayStateHolder.state.collectAsState()
                     val activeRaids by repository.activeRaids.collectAsState()
                     val isRefreshing by repository.isRefreshing.collectAsState()
                     val allSpecies by repository.species.collectAsState()
+                    val movesById by pokeboxRepository.movesById.collectAsState()
 
-                    if (drawerOpen) {
+                    val pendingSave = runtimeState.pendingPokemonSave
+                    if (pendingSave != null) {
+                        PendingPokemonSaveOverlay(
+                            detected = pendingSave,
+                            movesById = movesById,
+                            onSave = { saved ->
+                                pokeboxRepository.savePokemon(saved)
+                                OverlayStateHolder.dismissPendingPokemonSave()
+                                showTransientScanMessage("Saved ${pendingSave.species.speciesName} to Pokébox")
+                            },
+                            onDismiss = {
+                                OverlayStateHolder.dismissPendingPokemonSave()
+                            }
+                        )
+                    } else if (drawerOpen) {
                         QuickDrawerOverlay(
                             activeRaids = activeRaids,
                             allSpecies = allSpecies,
                             isRefreshingRaids = isRefreshing,
+                            hasMediaProjection = runtimeState.hasMediaProjection,
+                            onScanOwnPokemon = {
+                                triggerScanMyPokemon()
+                            },
                             onRefreshRaids = {
                                 serviceScope.launch {
                                     repository.refreshLiveRaids()
@@ -576,6 +629,11 @@ class OverlayService : Service() {
         try {
             windowManager.addView(view, params)
             drawerView = view
+            serviceScope.launch {
+                OverlayStateHolder.state.collect { state ->
+                    syncDrawerWindowVisibility(state.pendingPokemonSave != null || _isDrawerOpen.value)
+                }
+            }
         } catch (_: Throwable) {
             owner.performDestroy()
             drawerLifecycleOwner = null
@@ -584,10 +642,15 @@ class OverlayService : Service() {
 
     private fun setDrawerOpen(open: Boolean) {
         _isDrawerOpen.value = open
+        val hasPendingSave = OverlayStateHolder.state.value.pendingPokemonSave != null
+        syncDrawerWindowVisibility(open || hasPendingSave)
+    }
+
+    private fun syncDrawerWindowVisibility(visible: Boolean) {
         val view = drawerView ?: return
         val params = drawerParams ?: return
 
-        if (open) {
+        if (visible) {
             // Focusable while open (NO FLAG_NOT_FOCUSABLE) so keyboard works for Instant Search
             params.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
@@ -663,14 +726,63 @@ class OverlayService : Service() {
         }
 
         serviceScope.launch {
-            val matched = performSingleScan(isManualTrigger = true)
+            val matched = performSingleScan(isManualTrigger = true, allowOwnPokemonFallback = true)
             if (!matched) {
-                showTransientScanMessage("No boss found — try ≡")
+                showTransientScanMessage("No boss or Pokémon found — try ≡")
             }
         }
     }
 
-    private suspend fun performSingleScan(isManualTrigger: Boolean): Boolean {
+    private fun triggerScanMyPokemon() {
+        val state = OverlayStateHolder.state.value
+        if (!state.hasMediaProjection || !captureEngine.hasActiveProjection) {
+            showTransientScanMessage("Grant capture in app to scan")
+            return
+        }
+        setDrawerOpen(false)
+        serviceScope.launch {
+            delay(220L)
+            val found = performOwnPokemonScanOnly()
+            if (!found) {
+                showTransientScanMessage("No Pokémon details found on screen")
+            }
+        }
+    }
+
+    private suspend fun performOwnPokemonScanOnly(): Boolean {
+        if (!scanMutex.tryLock()) return false
+        OverlayStateHolder.update { it.copy(isScanningNow = true, lastScanMessage = null) }
+        var frameBitmap: android.graphics.Bitmap? = null
+        return try {
+            frameBitmap = captureEngine.captureLatestFrame()
+            val bitmap = frameBitmap ?: return false
+            val lines = ocrPipeline.recognizeLines(bitmap = bitmap, cropNormalized = myPokemonDetector.roiNormalized)
+            val detected = myPokemonDetector.detectFromLinesAndBitmap(
+                lines = lines,
+                bitmap = bitmap,
+                activeRaids = repository.activeRaids.value
+            )
+            if (detected != null) {
+                OverlayStateHolder.showPendingPokemonSave(detected)
+                true
+            } else {
+                false
+            }
+        } catch (_: Throwable) {
+            false
+        } finally {
+            try {
+                if (frameBitmap != null && !frameBitmap.isRecycled) frameBitmap.recycle()
+            } catch (_: Throwable) {}
+            OverlayStateHolder.update { it.copy(isScanningNow = false) }
+            scanMutex.unlock()
+        }
+    }
+
+    private suspend fun performSingleScan(
+        isManualTrigger: Boolean,
+        allowOwnPokemonFallback: Boolean = false
+    ): Boolean {
         if (!scanMutex.tryLock()) {
             return false
         }
@@ -693,6 +805,19 @@ class OverlayService : Service() {
             if (matchResult != null) {
                 OverlayStateHolder.showMatchedBoss(matchResult)
                 true
+            } else if (allowOwnPokemonFallback) {
+                val fullLines = ocrPipeline.recognizeLines(bitmap = bitmap, cropNormalized = myPokemonDetector.roiNormalized)
+                val own = myPokemonDetector.detectFromLinesAndBitmap(
+                    lines = fullLines,
+                    bitmap = bitmap,
+                    activeRaids = repository.activeRaids.value
+                )
+                if (own != null) {
+                    OverlayStateHolder.showPendingPokemonSave(own)
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             }
@@ -1000,12 +1125,16 @@ private fun CompactEdgePillOverlay(
 @Composable
 private fun PriorityWeaknessBannerOverlay(
     banner: ActiveBossBanner,
+    savedPokemon: List<SavedPokemon>,
+    speciesById: Map<String, PokemonSpecies>,
+    movesById: Map<String, MoveData>,
     onSelectForm: (PokemonSpecies) -> Unit,
     onDismiss: () -> Unit
 ) {
     val speciesId = banner.match.species.speciesId
     var showAvoidExpanded by remember(speciesId) { mutableStateOf(false) }
     var showFormSelector by remember(speciesId) { mutableStateOf(false) }
+    var showTeamExpanded by remember(speciesId) { mutableStateOf(false) }
 
     val primaryType = banner.matchup.defendingTypes.firstOrNull() ?: PokemonType.NORMAL
     val headerBgColor = primaryType.badgeColor()
@@ -1179,17 +1308,88 @@ private fun PriorityWeaknessBannerOverlay(
                 }
 
                 // Pure-white body rendering WeaknessPriorityStrip (2.56× first, 1.6× second, Avoid toggle)
-                Box(
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(Color(0xFFFFFFFF))
-                        .padding(horizontal = 12.dp, vertical = 10.dp)
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     WeaknessPriorityStrip(
                         matchup = banner.matchup,
                         showAvoidExpanded = showAvoidExpanded,
                         onToggleAvoid = { showAvoidExpanded = !showAvoidExpanded }
                     )
+
+                    if (savedPokemon.isNotEmpty()) {
+                        val verdict = remember(speciesId, savedPokemon, speciesById, movesById) {
+                            RaidBattleSimulator.simulatePersonalTeam(
+                                savedBox = savedPokemon,
+                                speciesById = speciesById,
+                                movesById = movesById,
+                                bossSpecies = banner.match.species,
+                                raidTier = 5
+                            )
+                        }
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color(0xFFF7F8FA))
+                                .clickable { showTeamExpanded = !showTeamExpanded }
+                                .padding(horizontal = 10.dp, vertical = 7.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = "My Best Team: ${verdict.verdictLabel}",
+                                    color = Color(0xFF1A1C20),
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = if (showTeamExpanded) "Hide ▲" else "${String.format(java.util.Locale.US, "Est %.2f", verdict.teamEstimator)} ▾",
+                                    color = Color(0xFF6E7582),
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                            if (showTeamExpanded) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    verdict.team.forEach { member ->
+                                        Column(
+                                            horizontalAlignment = Alignment.CenterHorizontally,
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(10.dp))
+                                                .background(Color.White)
+                                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                                        ) {
+                                            PokemonSprite(
+                                                spriteFile = member.species.spriteFile,
+                                                contentDescription = member.species.speciesName,
+                                                size = 28.dp
+                                            )
+                                            Text(
+                                                text = "CP ${member.pokemon.cp}",
+                                                color = Color(0xFF1A1C20),
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1202,6 +1402,8 @@ private fun QuickDrawerOverlay(
     activeRaids: List<RaidBossEntry>,
     allSpecies: List<PokemonSpecies>,
     isRefreshingRaids: Boolean,
+    hasMediaProjection: Boolean,
+    onScanOwnPokemon: () -> Unit,
     onRefreshRaids: () -> Unit,
     onSelectRaidBoss: (RaidBossEntry) -> Unit,
     onSelectSpecies: (PokemonSpecies) -> Unit,
@@ -1576,12 +1778,29 @@ private fun QuickDrawerOverlay(
                 HorizontalDivider(color = Color(0xFFECEFF4))
                 Spacer(modifier = Modifier.height(10.dp))
 
-                // Clear "Stop Overlay" button at the bottom calling stopSelf()
+                // Bottom actions: Scan My Pokémon + Stop Overlay
                 Row(
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.fillMaxWidth()
                 ) {
+                    if (hasMediaProjection) {
+                        Button(
+                            onClick = onScanOwnPokemon,
+                            shape = RoundedCornerShape(999.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF1A1C20),
+                                contentColor = Color.White
+                            ),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(
+                                text = "Scan My Pokémon",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
                     OutlinedButton(
                         onClick = onStopOverlay,
                         shape = RoundedCornerShape(999.dp),
@@ -1589,16 +1808,208 @@ private fun QuickDrawerOverlay(
                         colors = ButtonDefaults.outlinedButtonColors(
                             contentColor = Color(0xFFD32F2F)
                         ),
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.weight(1f)
                     ) {
                         Text(
                             text = "Stop Overlay",
-                            fontSize = 13.sp,
+                            fontSize = 12.sp,
                             fontWeight = FontWeight.Bold
                         )
                     }
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun PendingPokemonSaveOverlay(
+    detected: DetectedOwnPokemon,
+    movesById: Map<String, MoveData>,
+    onSave: (SavedPokemon) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var ivAtk by remember(detected) { mutableIntStateOf(detected.ivAtk ?: 12) }
+    var ivDef by remember(detected) { mutableIntStateOf(detected.ivDef ?: 12) }
+    var ivSta by remember(detected) { mutableIntStateOf(detected.ivSta ?: 12) }
+
+    val solvedLevel = remember(detected, ivAtk, ivDef, ivSta) {
+        PokemonMathEngine.solveLevel(
+            baseAtk = detected.species.baseAtk,
+            baseDef = detected.species.baseDef,
+            baseSta = detected.species.baseSta,
+            ivAtk = ivAtk,
+            ivDef = ivDef,
+            ivSta = ivSta,
+            cp = detected.cp,
+            hp = detected.hp,
+            powerUpDust = detected.powerUpDust,
+            isShadow = detected.isShadow,
+            isPurified = detected.isPurified,
+            isLucky = detected.isLucky
+        )
+    }
+
+    val moveEval = remember(detected, movesById) {
+        RaidBattleSimulator.evaluateMoveset(
+            species = detected.species,
+            movesById = movesById,
+            currentFastId = detected.fastMove?.moveId,
+            currentCharged1Id = detected.chargedMove1?.moveId,
+            currentCharged2Id = detected.chargedMove2?.moveId
+        )
+    }
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 20.dp)
+    ) {
+        Surface(
+            shape = RoundedCornerShape(22.dp),
+            color = Color.White,
+            border = BorderStroke(1.dp, Color(0xFFECEFF4)),
+            shadowElevation = 14.dp,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        PokemonSprite(
+                            spriteFile = detected.species.spriteFile,
+                            contentDescription = detected.species.speciesName,
+                            size = 42.dp
+                        )
+                        Column {
+                            Text(
+                                text = "Save ${detected.species.speciesName}",
+                                color = Color(0xFF1A1C20),
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                            Text(
+                                text = "CP ${detected.cp} • Lv ${formatLevel(solvedLevel)}${if (detected.isShadow) " • Shadow" else ""}",
+                                color = Color(0xFF6E7582),
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+                    IconButton(onClick = onDismiss, modifier = Modifier.size(28.dp)) {
+                        Icon(Icons.Default.Close, contentDescription = "Close", tint = Color(0xFF1A1C20))
+                    }
+                }
+
+                val moveLine = listOfNotNull(
+                    detected.fastMove?.displayName,
+                    detected.chargedMove1?.displayName,
+                    detected.chargedMove2?.displayName
+                ).joinToString(" / ")
+                if (moveLine.isNotEmpty()) {
+                    Text(
+                        text = "Moves: $moveLine",
+                        color = Color(0xFF1A1C20),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+
+                moveEval?.let { eval ->
+                    Text(
+                        text = eval.recommendationText,
+                        color = if (eval.isCurrentOptimal || eval.currentNeutralDps == null) {
+                            Color(0xFF16A34A)
+                        } else {
+                            Color(0xFFD97706)
+                        },
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                Text(
+                    text = if (detected.ivAtk != null) "Detected Appraisal IVs: $ivAtk/$ivDef/$ivSta" else "Confirm IVs: $ivAtk / $ivDef / $ivSta",
+                    color = Color(0xFF1A1C20),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                OverlayIvRow("Atk", ivAtk) { ivAtk = it }
+                OverlayIvRow("Def", ivDef) { ivDef = it }
+                OverlayIvRow("Sta", ivSta) { ivSta = it }
+
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        shape = RoundedCornerShape(999.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Cancel", fontSize = 12.sp)
+                    }
+                    Button(
+                        onClick = {
+                            onSave(
+                                SavedPokemon(
+                                    id = UUID.randomUUID().toString(),
+                                    speciesId = detected.species.speciesId,
+                                    pokebattlerId = detected.species.pokebattlerId
+                                        ?: detected.species.speciesId.uppercase(),
+                                    cp = detected.cp,
+                                    hp = detected.hp,
+                                    ivAtk = ivAtk,
+                                    ivDef = ivDef,
+                                    ivSta = ivSta,
+                                    level = solvedLevel,
+                                    isShadow = detected.isShadow,
+                                    isPurified = detected.isPurified,
+                                    isLucky = detected.isLucky,
+                                    isMegaCapable = detected.species.tags.contains("mega"),
+                                    fastMoveId = detected.fastMove?.moveId,
+                                    chargedMove1Id = detected.chargedMove1?.moveId,
+                                    chargedMove2Id = detected.chargedMove2?.moveId,
+                                    savedAtMs = System.currentTimeMillis()
+                                )
+                            )
+                        },
+                        shape = RoundedCornerShape(999.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF1A1C20),
+                            contentColor = Color.White
+                        ),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Save to Box", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun OverlayIvRow(label: String, value: Int, onChange: (Int) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Text("$label $value", color = Color(0xFF1A1C20), fontSize = 11.sp, modifier = Modifier.width(46.dp))
+        Slider(
+            value = value.toFloat(),
+            onValueChange = { onChange(it.roundToInt().coerceIn(0, 15)) },
+            valueRange = 0f..15f,
+            steps = 14,
+            modifier = Modifier.weight(1f)
+        )
     }
 }

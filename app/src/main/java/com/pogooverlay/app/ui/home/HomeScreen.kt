@@ -74,12 +74,16 @@ import com.pogooverlay.app.core.data.RaidBossEntry
 import com.pogooverlay.app.core.data.ScanMode
 import com.pogooverlay.app.core.data.SpeciesMatchResult
 import com.pogooverlay.app.core.data.TypeEffectivenessChart
+import com.pogooverlay.app.core.pokebox.MoveData
+import com.pogooverlay.app.core.pokebox.SavedPokemon
 import com.pogooverlay.app.ui.components.PokemonSprite
 import com.pogooverlay.app.ui.components.TypeChip
 import com.pogooverlay.app.ui.components.TypeDot
 import com.pogooverlay.app.ui.components.WeaknessPriorityStrip
 import com.pogooverlay.app.ui.components.badgeColor
 import com.pogooverlay.app.ui.components.contentColor
+import com.pogooverlay.app.ui.pokebox.BossBestTeamCard
+import com.pogooverlay.app.ui.pokebox.PokeboxTabContent
 import com.pogooverlay.app.ui.theme.PokedexBackground
 import com.pogooverlay.app.ui.theme.PokedexBorder
 import com.pogooverlay.app.ui.theme.PokedexDanger
@@ -95,6 +99,7 @@ import java.util.Locale
 
 private enum class HomeTab(val label: String) {
     RAIDS("Today's Raids"),
+    POKEBOX("My Pokébox"),
     SETUP("Setup & Status"),
 }
 
@@ -105,6 +110,8 @@ private data class PreviewBoss(
     val spriteFile: String?,
     val types: List<PokemonType>,
     val subtitle: String? = null,
+    val species: PokemonSpecies? = null,
+    val raidTierHint: Int = 5,
     val alternateForms: List<PokemonSpecies> = emptyList(),
 )
 
@@ -115,12 +122,16 @@ fun HomeScreen(
     lastRaidsRefreshEpochMs: Long?,
     isRefreshing: Boolean,
     lastError: String?,
+    savedPokemon: List<SavedPokemon>,
+    movesById: Map<String, MoveData>,
     overlayState: OverlayRuntimeState,
     hasOverlayPermission: Boolean,
     hasNotificationPermission: Boolean,
     needsNotificationPermission: Boolean,
     matcher: PokemonNameMatcher,
     onRefreshRaids: () -> Unit,
+    onSavePokemon: (SavedPokemon) -> Unit,
+    onDeletePokemon: (String) -> Unit,
     onRequestOverlayPermission: () -> Unit,
     onRequestNotificationPermission: () -> Unit,
     onActivateOverlay: () -> Unit,
@@ -150,6 +161,7 @@ fun HomeScreen(
             raid to matcher.matchText(raid.name, activeRaids)
         }
     }
+    val speciesById = remember(species) { species.associateBy { it.speciesId } }
 
     Column(
         modifier = Modifier
@@ -168,6 +180,9 @@ fun HomeScreen(
                 overlayState = overlayState,
                 activeRaidCount = activeRaids.size,
                 speciesCount = species.size,
+                savedPokemon = savedPokemon,
+                speciesById = speciesById,
+                movesById = movesById,
                 showAvoidExpanded = showAvoidExpanded,
                 onToggleAvoid = { showAvoidExpanded = !showAvoidExpanded },
                 onSelectForm = { form ->
@@ -178,6 +193,8 @@ fun HomeScreen(
                         spriteFile = form.spriteFile,
                         types = form.parsedTypes(),
                         subtitle = form.formLabel()?.let { "Form: $it" },
+                        species = form,
+                        raidTierHint = previewBoss?.raidTierHint ?: 5,
                         alternateForms = previewBoss?.alternateForms.orEmpty(),
                     )
                 },
@@ -214,6 +231,13 @@ fun HomeScreen(
                             onSelectRaid = { raid, matched ->
                                 val raidTypes = raid.types.mapNotNull { PokemonType.fromApiKey(it) }
                                     .ifEmpty { matched?.species?.parsedTypes().orEmpty() }
+                                val tierHint = when {
+                                    raid.tier.contains("1") -> 1
+                                    raid.tier.contains("3") -> 3
+                                    raid.tier.contains("Mega", ignoreCase = true) || raid.tier.contains("4") -> 4
+                                    raid.tier.contains("Primal", ignoreCase = true) || raid.tier.contains("6") -> 6
+                                    else -> 5
+                                }
                                 previewBoss = PreviewBoss(
                                     id = "raid:${raid.name}:${raid.tier}",
                                     displayName = raid.name,
@@ -221,6 +245,8 @@ fun HomeScreen(
                                     spriteFile = matched?.species?.spriteFile,
                                     types = raidTypes,
                                     subtitle = formatRaidSubtitle(raid),
+                                    species = matched?.species,
+                                    raidTierHint = tierHint,
                                     alternateForms = matched?.alternateForms.orEmpty(),
                                 )
                                 showAvoidExpanded = false
@@ -233,10 +259,21 @@ fun HomeScreen(
                                     spriteFile = chosen.spriteFile,
                                     types = chosen.parsedTypes(),
                                     subtitle = chosen.formLabel()?.let { "Form: $it" },
+                                    species = chosen,
+                                    raidTierHint = 5,
                                     alternateForms = matcher.getFormsForSpecies(chosen),
                                 )
                                 showAvoidExpanded = false
                             },
+                        )
+
+                        HomeTab.POKEBOX -> PokeboxTabContent(
+                            savedPokemon = savedPokemon,
+                            speciesById = speciesById,
+                            movesById = movesById,
+                            matcher = matcher,
+                            onSavePokemon = onSavePokemon,
+                            onDeletePokemon = onDeletePokemon,
                         )
 
                         HomeTab.SETUP -> SetupStatusContent(
@@ -273,6 +310,9 @@ private fun HeroHeader(
     overlayState: OverlayRuntimeState,
     activeRaidCount: Int,
     speciesCount: Int,
+    savedPokemon: List<SavedPokemon>,
+    speciesById: Map<String, PokemonSpecies>,
+    movesById: Map<String, MoveData>,
     showAvoidExpanded: Boolean,
     onToggleAvoid: () -> Unit,
     onSelectForm: (PokemonSpecies) -> Unit,
@@ -548,19 +588,32 @@ private fun HeroHeader(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(max = 220.dp),
+                        .heightIn(max = 260.dp),
                     shape = RoundedCornerShape(20.dp),
                     color = PokedexSurface,
                     shadowElevation = 2.dp,
                 ) {
-                    WeaknessPriorityStrip(
-                        matchup = matchup,
-                        showAvoidExpanded = showAvoidExpanded,
-                        onToggleAvoid = onToggleAvoid,
+                    Column(
                         modifier = Modifier
                             .verticalScroll(rememberScrollState())
                             .padding(12.dp),
-                    )
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        WeaknessPriorityStrip(
+                            matchup = matchup,
+                            showAvoidExpanded = showAvoidExpanded,
+                            onToggleAvoid = onToggleAvoid,
+                        )
+                        previewBoss.species?.let { sp ->
+                            BossBestTeamCard(
+                                bossSpecies = sp,
+                                savedPokemon = savedPokemon,
+                                speciesById = speciesById,
+                                movesById = movesById,
+                                initialTier = previewBoss.raidTierHint,
+                            )
+                        }
+                    }
                 }
             }
         }

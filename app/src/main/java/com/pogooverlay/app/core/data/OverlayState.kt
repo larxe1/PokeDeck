@@ -1,5 +1,6 @@
 package com.pogooverlay.app.core.data
 
+import com.pogooverlay.app.core.detector.DetectedOwnPokemon
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -22,6 +23,7 @@ data class OverlayRuntimeState(
     val hasMediaProjection: Boolean = false,
     val isScanningNow: Boolean = false,
     val activeBanner: ActiveBossBanner? = null,
+    val pendingPokemonSave: DetectedOwnPokemon? = null,
     val lastScanMessage: String? = null
 )
 
@@ -84,6 +86,19 @@ object OverlayStateHolder {
 
     fun dismissBanner() {
         _state.update { it.copy(activeBanner = null) }
+    }
+
+    fun showPendingPokemonSave(detected: DetectedOwnPokemon) {
+        _state.update {
+            it.copy(
+                pendingPokemonSave = detected,
+                lastScanMessage = "Scanned ${detected.species.speciesName} (CP ${detected.cp})"
+            )
+        }
+    }
+
+    fun dismissPendingPokemonSave() {
+        _state.update { it.copy(pendingPokemonSave = null) }
     }
 
     fun resetStopped() {

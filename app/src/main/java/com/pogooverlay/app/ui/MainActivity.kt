@@ -59,7 +59,9 @@ class MainActivity : ComponentActivity() {
         refreshPermissionFlags()
 
         val repository = PoGoOverlayApp.instance.repository
+        val pokeboxRepository = PoGoOverlayApp.instance.pokeboxRepository
         repository.ensureLoaded()
+        pokeboxRepository.ensureLoaded()
         lifecycleScope.launch {
             repository.refreshLiveRaids()
         }
@@ -71,6 +73,8 @@ class MainActivity : ComponentActivity() {
                 val lastRefresh by repository.lastRaidsRefreshEpochMs.collectAsStateWithLifecycle()
                 val isRefreshing by repository.isRefreshing.collectAsStateWithLifecycle()
                 val lastError by repository.lastError.collectAsStateWithLifecycle()
+                val savedPokemon by pokeboxRepository.savedPokemon.collectAsStateWithLifecycle()
+                val movesById by pokeboxRepository.movesById.collectAsStateWithLifecycle()
                 val overlayState by OverlayStateHolder.state.collectAsStateWithLifecycle()
                 val matcher = remember(species) { repository.getMatcher() }
 
@@ -80,6 +84,8 @@ class MainActivity : ComponentActivity() {
                     lastRaidsRefreshEpochMs = lastRefresh,
                     isRefreshing = isRefreshing,
                     lastError = lastError,
+                    savedPokemon = savedPokemon,
+                    movesById = movesById,
                     overlayState = overlayState,
                     hasOverlayPermission = hasOverlayPermission,
                     hasNotificationPermission = hasNotificationPermission,
@@ -90,6 +96,8 @@ class MainActivity : ComponentActivity() {
                             repository.refreshLiveRaids()
                         }
                     },
+                    onSavePokemon = { pokeboxRepository.savePokemon(it) },
+                    onDeletePokemon = { pokeboxRepository.deletePokemon(it) },
                     onRequestOverlayPermission = ::launchOverlayPermissionSettings,
                     onRequestNotificationPermission = ::requestNotificationPermissionIfNeeded,
                     onActivateOverlay = ::activateOverlayWithCapture,

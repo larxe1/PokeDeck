@@ -1,6 +1,17 @@
 .env
 *.env
 .env.*
+*.local
+config.js
+config.local.js
+*.pem
+*.key
+*.cert
+*.secret
+secrets.json
+credentials.json
+service-account*.json
+client_secret*.json
 local.properties
 .gradle/
 build/

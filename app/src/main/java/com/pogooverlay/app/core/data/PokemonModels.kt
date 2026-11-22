@@ -9,7 +9,13 @@ data class PokemonSpecies(
     val dex: Int,
     val types: List<String>,
     val tags: List<String> = emptyList(),
-    val spriteFile: String? = null
+    val spriteFile: String? = null,
+    val pokebattlerId: String? = null,
+    val baseAtk: Int = 0,
+    val baseDef: Int = 0,
+    val baseSta: Int = 0,
+    val quickMoves: List<String> = emptyList(),
+    val cinematicMoves: List<String> = emptyList()
 ) {
     fun parsedTypes(): List<PokemonType> =
         types.mapNotNull { PokemonType.fromApiKey(it) }.distinct()

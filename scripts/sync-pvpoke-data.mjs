@@ -16,10 +16,14 @@ const PVPOKE_URL =
   "https://raw.githubusercontent.com/pvpoke/pvpoke/master/src/data/gamemaster/pokemon.json";
 const SCRAPEDDUCK_RAIDS_URL =
   "https://raw.githubusercontent.com/bigfoott/ScrapedDuck/data/raids.min.json";
+const POKEBATTLER_POKEMON_URL = "https://fight.pokebattler.com/pokemon";
+const POKEBATTLER_MOVES_URL = "https://fight.pokebattler.com/moves";
 const POKESPRITE_ZIP_URL =
   "https://github.com/msikma/pokesprite/archive/refs/heads/master.zip";
 const POKEAPI_SPRITE_BASE =
   "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon";
+
+const forceSprites = process.argv.includes("--force-sprites");
 
 async function fetchJson(url) {
   const response = await fetch(url);
@@ -64,7 +68,130 @@ function normalizePokemonEntry(entry) {
     dex: Number(entry.dex ?? 0),
     types,
     tags,
+    _rawBaseStats: entry.baseStats ?? null,
+    _rawFastMoves: Array.isArray(entry.fastMoves) ? entry.fastMoves : [],
+    _rawChargedMoves: Array.isArray(entry.chargedMoves) ? entry.chargedMoves : [],
   };
+}
+
+function formatMoveDisplayName(moveId) {
+  return moveId
+    .replace(/_FAST$/, "")
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function normalizeMovesList(rawMovesJson) {
+  const arr = Array.isArray(rawMovesJson?.move) ? rawMovesJson.move : [];
+  const moves = [];
+  for (const m of arr) {
+    const moveId = String(m.moveId ?? "").trim();
+    if (!moveId) continue;
+    const rawType = String(m.type ?? "").trim();
+    const type = rawType.replace(/^POKEMON_TYPE_/i, "").toLowerCase();
+    if (!type || type === "none") continue;
+    const durationMs = Number(m.durationMs ?? 0);
+    if (durationMs <= 0) continue;
+    const isFast = moveId.endsWith("_FAST") || Number(m.energyDelta ?? 0) > 0;
+    moves.push({
+      moveId,
+      displayName: formatMoveDisplayName(moveId),
+      type,
+      power: Number(m.power ?? 0),
+      durationMs,
+      energyDelta: Number(m.energyDelta ?? 0),
+      isFast,
+    });
+  }
+  return moves;
+}
+
+function buildPokebattlerIndex(rawPbJson) {
+  const arr = Array.isArray(rawPbJson?.pokemon) ? rawPbJson.pokemon : [];
+  const map = new Map();
+  for (const p of arr) {
+    if (p?.pokemonId) {
+      map.set(String(p.pokemonId).toUpperCase(), p);
+    }
+  }
+  return map;
+}
+
+function candidatePokebattlerIds(speciesId) {
+  const upper = speciesId.toUpperCase();
+  const list = [
+    upper,
+    `${upper}_FORM`,
+    upper.replace(/_ALOLAN\b/g, "_ALOLA_FORM"),
+    upper.replace(/_GALARIAN\b/g, "_GALAR_FORM"),
+    upper.replace(/_HISUIAN\b/g, "_HISUI_FORM"),
+    upper.replace(/_PALDEAN\b/g, "_PALDEA_FORM"),
+    upper.replace(/_ALOLAN\b/g, "_ALOLA"),
+    upper.replace(/_GALARIAN\b/g, "_GALAR"),
+    upper.replace(/_HISUIAN\b/g, "_HISUI"),
+    upper.replace(/_PALDEAN\b/g, "_PALDEA"),
+  ];
+  // Common PvPoke -> Pokebattler form suffixes
+  const baseFirst = upper.split("_")[0];
+  if (baseFirst) {
+    list.push(baseFirst);
+  }
+  return [...new Set(list)];
+}
+
+function enrichWithPokebattler(compactPokemon, pbMap, moveIdSet) {
+  let pbMatched = 0;
+  for (const entry of compactPokemon) {
+    const candidates = candidatePokebattlerIds(entry.speciesId);
+    let pb = null;
+    for (const cand of candidates) {
+      if (pbMap.has(cand)) {
+        pb = pbMap.get(cand);
+        break;
+      }
+    }
+
+    const pbAtk = Number(pb?.stats?.baseAttack ?? 0);
+    const pbDef = Number(pb?.stats?.baseDefense ?? 0);
+    const pbSta = Number(pb?.stats?.baseStamina ?? 0);
+    const pvAtk = Number(entry._rawBaseStats?.atk ?? 0);
+    const pvDef = Number(entry._rawBaseStats?.def ?? 0);
+    const pvSta = Number(entry._rawBaseStats?.hp ?? 0);
+
+    entry.pokebattlerId = pb?.pokemonId ?? candidates[0];
+    entry.baseAtk = pbAtk > 0 ? pbAtk : pvAtk;
+    entry.baseDef = pbDef > 0 ? pbDef : pvDef;
+    entry.baseSta = pbSta > 0 ? pbSta : pvSta;
+
+    const pbQuick = Array.isArray(pb?.quickMoves)
+      ? pb.quickMoves.filter((id) => moveIdSet.has(id))
+      : [];
+    const pbCin = Array.isArray(pb?.cinematicMoves)
+      ? pb.cinematicMoves.filter((id) => moveIdSet.has(id))
+      : [];
+
+    const pvQuick = entry._rawFastMoves
+      .map((m) => {
+        const up = String(m).toUpperCase();
+        return moveIdSet.has(`${up}_FAST`) ? `${up}_FAST` : up;
+      })
+      .filter((id) => moveIdSet.has(id));
+    const pvCin = entry._rawChargedMoves
+      .map((m) => String(m).toUpperCase())
+      .filter((id) => moveIdSet.has(id));
+
+    entry.quickMoves = pbQuick.length > 0 ? [...new Set(pbQuick)] : [...new Set(pvQuick)];
+    entry.cinematicMoves = pbCin.length > 0 ? [...new Set(pbCin)] : [...new Set(pvCin)];
+
+    if (pb) pbMatched++;
+
+    delete entry._rawBaseStats;
+    delete entry._rawFastMoves;
+    delete entry._rawChargedMoves;
+  }
+  console.log(`Enriched ${compactPokemon.length} species (${pbMatched} direct Pokébattler matches).`);
 }
 
 function normalizeRaidEntry(entry) {
@@ -95,7 +222,6 @@ function normalizeRaidEntry(entry) {
 }
 
 async function extractZip(zipPath, destDir) {
-  // Prefer `tar -xf` (available natively on Windows 10/11, macOS, and Linux)
   try {
     await execFileAsync("tar", ["-xf", zipPath, "-C", destDir], {
       maxBuffer: 20 * 1024 * 1024,
@@ -125,7 +251,7 @@ async function loadPokespriteIndex(extractedDir) {
     throw new Error(`No extracted pokesprite root folder found in ${extractedDir}`);
   }
   const regularDir = path.join(extractedDir, repoDir, "pokemon-gen8", "regular");
-  const index = new Map(); // slug (without .png) -> full file path
+  const index = new Map();
 
   async function scanDir(dir, prefix = "") {
     const entries = await fs.readdir(dir, { withFileTypes: true });
@@ -133,7 +259,6 @@ async function loadPokespriteIndex(extractedDir) {
       const fullPath = path.join(dir, entry.name);
       if (entry.isFile() && entry.name.endsWith(".png")) {
         const slug = entry.name.slice(0, -4).toLowerCase();
-        // Top-level regular sprites take precedence over subdirectories like female/
         if (!prefix || !index.has(slug)) {
           index.set(prefix ? `${prefix}/${slug}` : slug, fullPath);
         }
@@ -250,7 +375,6 @@ const EXACT_SLUG_OVERRIDES = {
 };
 
 function baseSlugFromSpeciesName(speciesName) {
-  // Strip trailing "(Form)" and normalize to pokesprite slug
   const base = speciesName.replace(/\s*\([^)]*\)\s*$/, "").trim();
   return base
     .toLowerCase()
@@ -264,12 +388,9 @@ function baseSlugFromSpeciesName(speciesName) {
 function candidatePokespriteSlugs(entry) {
   const id = entry.speciesId.toLowerCase();
   const candidates = [];
-
   if (EXACT_SLUG_OVERRIDES[id]) {
     candidates.push(EXACT_SLUG_OVERRIDES[id]);
   }
-
-  // Transform common PvPoke suffixes into pokesprite form slugs
   const transformed = id
     .replace(/_alolan\b/g, "-alola")
     .replace(/_galarian\b/g, "-galar")
@@ -303,17 +424,11 @@ function candidatePokespriteSlugs(entry) {
   candidates.push(transformed);
   candidates.push(id.replace(/_/g, "-"));
 
-  // Base species fallbacks (for exotic costume/regional forms not present in pokesprite gen8)
   const baseFromName = baseSlugFromSpeciesName(entry.speciesName);
-  if (baseFromName) {
-    candidates.push(baseFromName);
-  }
+  if (baseFromName) candidates.push(baseFromName);
   const firstToken = id.split("_")[0];
-  if (firstToken) {
-    candidates.push(firstToken);
-  }
+  if (firstToken) candidates.push(firstToken);
 
-  // Deduplicate while preserving priority order
   return [...new Set(candidates.filter(Boolean))];
 }
 
@@ -334,7 +449,37 @@ async function runWithConcurrency(items, concurrency, worker) {
   return results;
 }
 
+async function tryReuseExistingSprites(compactPokemon) {
+  if (forceSprites) return false;
+  try {
+    const existingSprites = new Set(await fs.readdir(spritesDir));
+    if (existingSprites.size < 1000) return false;
+    const prevDbPath = path.join(assetsDir, "pokemon_db.json");
+    const prevDb = JSON.parse(await fs.readFile(prevDbPath, "utf8"));
+    const prevById = new Map(prevDb.map((p) => [p.speciesId, p.spriteFile]));
+    let hits = 0;
+    for (const entry of compactPokemon) {
+      const sf = prevById.get(entry.speciesId);
+      if (sf && existingSprites.has(sf)) {
+        entry.spriteFile = sf;
+        hits++;
+      }
+    }
+    if (hits >= compactPokemon.length * 0.95) {
+      console.log(`Reused ${hits}/${compactPokemon.length} bundled offline sprites (pass --force-sprites to re-fetch).`);
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 async function bundleSprites(compactPokemon) {
+  if (await tryReuseExistingSprites(compactPokemon)) {
+    return;
+  }
+
   await fs.rm(spritesDir, { recursive: true, force: true });
   await fs.mkdir(spritesDir, { recursive: true });
 
@@ -352,8 +497,6 @@ async function bundleSprites(compactPokemon) {
     await extractZip(zipPath, extractDir);
 
     const pokespriteIndex = await loadPokespriteIndex(extractDir);
-    console.log(`Indexed ${pokespriteIndex.size} pokesprite PNGs.`);
-
     const copiedFiles = new Set();
     const missingForPokeApi = [];
     let pokespriteHits = 0;
@@ -381,12 +524,7 @@ async function bundleSprites(compactPokemon) {
       }
     }
 
-    // Deduplicate PokeAPI fallback fetches by dex number
     const uniqueDexes = [...new Set(missingForPokeApi.map((e) => e.dex).filter((d) => d > 0))];
-    console.log(
-      `Matched ${pokespriteHits}/${compactPokemon.length} entries via pokesprite. Fetching ${uniqueDexes.length} unique fallback dex sprites from PokeAPI...`
-    );
-
     const downloadedDexFiles = new Map();
     await runWithConcurrency(uniqueDexes, 16, async (dex) => {
       const url = `${POKEAPI_SPRITE_BASE}/${dex}.png`;
@@ -398,54 +536,56 @@ async function bundleSprites(compactPokemon) {
           downloadedDexFiles.set(dex, filename);
         }
       } catch (err) {
-        console.warn(`Warning: failed to fetch PokeAPI sprite for dex #${dex}: ${err.message}`);
+        console.warn(`Warning: failed PokeAPI sprite #${dex}: ${err.message}`);
       }
     });
 
-    let pokeApiHits = 0;
     for (const entry of missingForPokeApi) {
-      const filename = downloadedDexFiles.get(entry.dex) ?? null;
-      entry.spriteFile = filename;
-      if (filename) pokeApiHits++;
+      entry.spriteFile = downloadedDexFiles.get(entry.dex) ?? null;
     }
-
-    const totalMatched = pokespriteHits + pokeApiHits;
-    const coveragePct = ((totalMatched / compactPokemon.length) * 100).toFixed(2);
-    console.log(
-      `Sprite bundling complete: ${totalMatched}/${compactPokemon.length} (${coveragePct}%) matched (${pokespriteHits} pokesprite, ${pokeApiHits} PokeAPI, ${copiedFiles.size + downloadedDexFiles.size} PNG files bundled).`
-    );
+    console.log(`Sprite bundling complete (${pokespriteHits} pokesprite + PokeAPI fallback).`);
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
-    console.log("Cleaned up temporary pokesprite directory.");
   }
 }
 
 async function main() {
   await fs.mkdir(assetsDir, { recursive: true });
 
-  console.log("Fetching PvPoke pokemon.json...");
-  const rawPokemon = await fetchJson(PVPOKE_URL);
+  console.log("Fetching PvPoke, Pokébattler Pokémon/Moves, and ScrapedDuck Raids...");
+  const [rawPokemon, rawPbPokemon, rawPbMoves, rawRaids] = await Promise.all([
+    fetchJson(PVPOKE_URL),
+    fetchJson(POKEBATTLER_POKEMON_URL),
+    fetchJson(POKEBATTLER_MOVES_URL),
+    fetchJson(SCRAPEDDUCK_RAIDS_URL),
+  ]);
+
   if (!Array.isArray(rawPokemon)) {
     throw new Error("Expected PvPoke pokemon.json to be an array");
   }
 
+  const moves = normalizeMovesList(rawPbMoves);
+  const moveIdSet = new Set(moves.map((m) => m.moveId));
+  const movesOutPath = path.join(assetsDir, "moves_db.json");
+  await fs.writeFile(movesOutPath, JSON.stringify(moves) + "\n", "utf8");
+  console.log(`Wrote ${moves.length} moves to ${movesOutPath}`);
+
   const compactPokemon = rawPokemon.map(normalizePokemonEntry).filter(Boolean);
   await bundleSprites(compactPokemon);
 
+  const pbMap = buildPokebattlerIndex(rawPbPokemon);
+  enrichWithPokebattler(compactPokemon, pbMap, moveIdSet);
+
   const pokemonOutPath = path.join(assetsDir, "pokemon_db.json");
-  await fs.writeFile(pokemonOutPath, JSON.stringify(compactPokemon, null, 2) + "\n", "utf8");
+  await fs.writeFile(pokemonOutPath, JSON.stringify(compactPokemon) + "\n", "utf8");
   console.log(`Wrote ${compactPokemon.length} species to ${pokemonOutPath}`);
 
-  console.log("Fetching ScrapedDuck raids.min.json...");
-  const rawRaids = await fetchJson(SCRAPEDDUCK_RAIDS_URL);
-  if (!Array.isArray(rawRaids)) {
-    throw new Error("Expected ScrapedDuck raids.min.json to be an array");
+  if (Array.isArray(rawRaids)) {
+    const raidsFallback = rawRaids.map(normalizeRaidEntry);
+    const raidsOutPath = path.join(assetsDir, "raids_fallback.json");
+    await fs.writeFile(raidsOutPath, JSON.stringify(raidsFallback, null, 2) + "\n", "utf8");
+    console.log(`Wrote ${raidsFallback.length} raids to ${raidsOutPath}`);
   }
-
-  const raidsFallback = rawRaids.map(normalizeRaidEntry);
-  const raidsOutPath = path.join(assetsDir, "raids_fallback.json");
-  await fs.writeFile(raidsOutPath, JSON.stringify(raidsFallback, null, 2) + "\n", "utf8");
-  console.log(`Wrote ${raidsFallback.length} raids to ${raidsOutPath}`);
 }
 
 main().catch((err) => {

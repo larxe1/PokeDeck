@@ -24,6 +24,7 @@ data class OverlayRuntimeState(
     val isScanningNow: Boolean = false,
     val activeBanner: ActiveBossBanner? = null,
     val pendingPokemonSave: DetectedOwnPokemon? = null,
+    val awaitingFollowUpScan: Boolean = false,
     val lastScanMessage: String? = null
 )
 
@@ -92,13 +93,38 @@ object OverlayStateHolder {
         _state.update {
             it.copy(
                 pendingPokemonSave = detected,
-                lastScanMessage = "Scanned ${detected.species.speciesName} (CP ${detected.cp})"
+                awaitingFollowUpScan = false,
+                lastScanMessage = "Scanned ${detected.species.speciesName}${detected.cp?.let { c -> " (CP $c)" } ?: ""}"
+            )
+        }
+    }
+
+    fun beginFollowUpPokemonScan() {
+        _state.update {
+            it.copy(
+                awaitingFollowUpScan = true,
+                lastScanMessage = "Scroll & tap 📷 to scan more info"
+            )
+        }
+    }
+
+    fun mergePendingPokemonSave(incoming: DetectedOwnPokemon) {
+        _state.update { current ->
+            val merged = current.pendingPokemonSave?.mergeWith(incoming) ?: incoming
+            current.copy(
+                pendingPokemonSave = merged,
+                awaitingFollowUpScan = false,
+                lastScanMessage = "Updated ${merged.species.speciesName}"
             )
         }
     }
 
     fun dismissPendingPokemonSave() {
-        _state.update { it.copy(pendingPokemonSave = null) }
+        _state.update { it.copy(pendingPokemonSave = null, awaitingFollowUpScan = false) }
+    }
+
+    fun clearScanMessage() {
+        _state.update { it.copy(lastScanMessage = null, awaitingFollowUpScan = false) }
     }
 
     fun resetStopped() {

@@ -95,7 +95,7 @@ class RaidBossDetector(
     override val id: String = DETECTOR_ID
 
     val autoRoi: RectF by lazy {
-        RectF(0.05f, 0.08f, 0.95f, 0.42f)
+        RectF(0.05f, 0.14f, 0.95f, 0.44f)
     }
 
     val manualRoi: RectF by lazy {
@@ -127,6 +127,7 @@ class RaidBossDetector(
         isManualTrigger: Boolean
     ): SpeciesMatchResult? {
         if (lines.isEmpty()) return null
+        if (ScreenClassifier.classify(lines) == ScreenKind.MY_POKEMON) return null
 
         val cleanLines = lines
             .filter { !isNoiseLine(it.text) }

@@ -51,6 +51,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Close
@@ -82,6 +83,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -103,6 +105,8 @@ import com.pogooverlay.app.core.data.TypeEffectivenessChart
 import com.pogooverlay.app.core.detector.DetectedOwnPokemon
 import com.pogooverlay.app.core.detector.MyPokemonDetector
 import com.pogooverlay.app.core.detector.RaidBossDetector
+import com.pogooverlay.app.core.detector.ScreenClassifier
+import com.pogooverlay.app.core.detector.ScreenKind
 import com.pogooverlay.app.core.ocr.OcrPipeline
 import com.pogooverlay.app.core.pokebox.MoveData
 import com.pogooverlay.app.core.pokebox.PokeboxRepository
@@ -479,7 +483,7 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = 28
+            y = 6
         }
         bannerParams = params
 
@@ -569,14 +573,17 @@ class OverlayService : Service() {
                     val movesById by pokeboxRepository.movesById.collectAsState()
 
                     val pendingSave = runtimeState.pendingPokemonSave
-                    if (pendingSave != null) {
+                    if (pendingSave != null && !runtimeState.awaitingFollowUpScan) {
                         PendingPokemonSaveOverlay(
                             detected = pendingSave,
                             movesById = movesById,
                             onSave = { saved ->
                                 pokeboxRepository.savePokemon(saved)
                                 OverlayStateHolder.dismissPendingPokemonSave()
-                                showTransientScanMessage("Saved ${pendingSave.species.speciesName} to Pokébox")
+                                showTransientScanMessage("Saved ${saved.nickname ?: pendingSave.species.speciesName}")
+                            },
+                            onBeginFollowUpScan = {
+                                OverlayStateHolder.beginFollowUpPokemonScan()
                             },
                             onDismiss = {
                                 OverlayStateHolder.dismissPendingPokemonSave()
@@ -631,7 +638,8 @@ class OverlayService : Service() {
             drawerView = view
             serviceScope.launch {
                 OverlayStateHolder.state.collect { state ->
-                    syncDrawerWindowVisibility(state.pendingPokemonSave != null || _isDrawerOpen.value)
+                    val showSaveModal = state.pendingPokemonSave != null && !state.awaitingFollowUpScan
+                    syncDrawerWindowVisibility(showSaveModal || _isDrawerOpen.value)
                 }
             }
         } catch (_: Throwable) {
@@ -642,8 +650,9 @@ class OverlayService : Service() {
 
     private fun setDrawerOpen(open: Boolean) {
         _isDrawerOpen.value = open
-        val hasPendingSave = OverlayStateHolder.state.value.pendingPokemonSave != null
-        syncDrawerWindowVisibility(open || hasPendingSave)
+        val state = OverlayStateHolder.state.value
+        val showSaveModal = state.pendingPokemonSave != null && !state.awaitingFollowUpScan
+        syncDrawerWindowVisibility(open || showSaveModal)
     }
 
     private fun syncDrawerWindowVisibility(visible: Boolean) {
@@ -796,17 +805,44 @@ class OverlayService : Service() {
         return try {
             frameBitmap = captureEngine.captureLatestFrame()
             val bitmap = frameBitmap ?: return false
-            val roi = raidBossDetector.roiFor(isManualTrigger = isManualTrigger)
-            val lines = ocrPipeline.recognizeLines(bitmap = bitmap, cropNormalized = roi)
+            val fullLines = ocrPipeline.recognizeLines(
+                bitmap = bitmap,
+                cropNormalized = if (isManualTrigger) myPokemonDetector.roiNormalized else android.graphics.RectF(0.04f, 0.14f, 0.96f, 0.88f)
+            )
+            val screenKind = ScreenClassifier.classify(fullLines)
+            val isFollowUp = OverlayStateHolder.state.value.awaitingFollowUpScan
+
+            if (isManualTrigger && (isFollowUp || screenKind == ScreenKind.MY_POKEMON)) {
+                val own = myPokemonDetector.detectFromLinesAndBitmap(
+                    lines = fullLines,
+                    bitmap = bitmap,
+                    activeRaids = repository.activeRaids.value
+                )
+                if (own != null) {
+                    if (isFollowUp) {
+                        OverlayStateHolder.mergePendingPokemonSave(own)
+                    } else {
+                        OverlayStateHolder.showPendingPokemonSave(own)
+                    }
+                    return true
+                }
+                return false
+            }
+
+            if (screenKind == ScreenKind.MY_POKEMON) {
+                return false
+            }
+
+            val topCutoff = if (isManualTrigger) 0.62f else 0.44f
+            val raidLines = fullLines.filter { it.normalizedTop in 0.06f..topCutoff }
             val matchResult = raidBossDetector.detect(
-                lines = lines,
+                lines = raidLines,
                 isManualTrigger = isManualTrigger
             )
             if (matchResult != null) {
                 OverlayStateHolder.showMatchedBoss(matchResult)
                 true
             } else if (allowOwnPokemonFallback) {
-                val fullLines = ocrPipeline.recognizeLines(bitmap = bitmap, cropNormalized = myPokemonDetector.roiNormalized)
                 val own = myPokemonDetector.detectFromLinesAndBitmap(
                     lines = fullLines,
                     bitmap = bitmap,
@@ -1101,21 +1137,41 @@ private fun CompactEdgePillOverlay(
         }
 
         val scanMessage = state.lastScanMessage
+        LaunchedEffect(scanMessage, state.awaitingFollowUpScan) {
+            if (!scanMessage.isNullOrBlank() && !state.awaitingFollowUpScan) {
+                delay(2200L)
+                OverlayStateHolder.clearScanMessage()
+            }
+        }
         if (!scanMessage.isNullOrBlank()) {
             Spacer(modifier = Modifier.height(4.dp))
             Surface(
                 shape = RoundedCornerShape(999.dp),
                 color = Color(0xFFFFFFFF),
                 border = BorderStroke(1.dp, Color(0xFFECEFF4)),
-                shadowElevation = 4.dp
+                shadowElevation = 4.dp,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(999.dp))
+                    .clickable { OverlayStateHolder.clearScanMessage() }
             ) {
-                Text(
-                    text = scanMessage,
-                    color = Color(0xFF1A1C20),
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium,
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        text = scanMessage,
+                        color = Color(0xFF1A1C20),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = "Dismiss notification",
+                        tint = Color(0xFF6E7582),
+                        modifier = Modifier.size(12.dp)
+                    )
+                }
             }
         }
     }
@@ -1132,7 +1188,6 @@ private fun PriorityWeaknessBannerOverlay(
     onDismiss: () -> Unit
 ) {
     val speciesId = banner.match.species.speciesId
-    var showAvoidExpanded by remember(speciesId) { mutableStateOf(false) }
     var showFormSelector by remember(speciesId) { mutableStateOf(false) }
     var showTeamExpanded by remember(speciesId) { mutableStateOf(false) }
 
@@ -1142,10 +1197,21 @@ private fun PriorityWeaknessBannerOverlay(
 
     var horizontalDragAccumulator by remember(speciesId) { mutableStateOf(0f) }
 
+    val verdict = remember(speciesId, savedPokemon, speciesById, movesById) {
+        if (savedPokemon.isEmpty()) null
+        else RaidBattleSimulator.simulatePersonalTeam(
+            savedBox = savedPokemon,
+            speciesById = speciesById,
+            movesById = movesById,
+            bossSpecies = banner.match.species,
+            raidTier = 5
+        )
+    }
+
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .padding(horizontal = 10.dp, vertical = 2.dp)
             .pointerInput(speciesId) {
                 detectHorizontalDragGestures(
                     onDragStart = { horizontalDragAccumulator = 0f },
@@ -1161,100 +1227,95 @@ private fun PriorityWeaknessBannerOverlay(
             }
     ) {
         Surface(
-            shape = RoundedCornerShape(20.dp),
+            shape = RoundedCornerShape(14.dp),
             color = Color(0xFFFFFFFF),
             border = BorderStroke(1.dp, Color(0xFFECEFF4)),
-            shadowElevation = 10.dp,
+            shadowElevation = 8.dp,
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(modifier = Modifier.fillMaxWidth()) {
-                // Slim top header band tinted in primaryType.badgeColor()
+                // Ultra-slim single-line header
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp),
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(headerBgColor)
-                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                        .padding(horizontal = 10.dp, vertical = 4.dp)
                 ) {
                     PokemonSprite(
                         spriteFile = banner.match.species.spriteFile,
                         contentDescription = banner.match.displayTitle,
-                        size = 36.dp,
+                        size = 20.dp,
                         fallbackTint = headerContentColor
                     )
 
-                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = banner.match.displayTitle,
+                        color = headerContentColor,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
 
-                    Column(modifier = Modifier.weight(1f)) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    val prefix = banner.match.detectedPrefix
+                    if (!prefix.isNullOrBlank()) {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(999.dp))
+                                .background(Color.Black.copy(alpha = 0.22f))
+                                .padding(horizontal = 5.dp, vertical = 1.dp)
                         ) {
                             Text(
-                                text = banner.match.displayTitle,
-                                color = headerContentColor,
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.ExtraBold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-
-                            val prefix = banner.match.detectedPrefix
-                            if (!prefix.isNullOrBlank()) {
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(999.dp))
-                                        .background(Color.Black.copy(alpha = 0.22f))
-                                        .padding(horizontal = 7.dp, vertical = 2.dp)
-                                ) {
-                                    Text(
-                                        text = prefix,
-                                        color = Color.White,
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-                            }
-                        }
-
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
-                            Text(
-                                text = banner.matchup.defendingTypes.joinToString(" / ") { it.displayName },
-                                color = headerContentColor.copy(alpha = 0.9f),
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.SemiBold
+                                text = prefix,
+                                color = Color.White,
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold
                             )
                         }
                     }
 
-                    // Interactive [Form ▾] chip when alternateForms.size > 1
+                    if (verdict != null) {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(999.dp))
+                                .background(Color.White.copy(alpha = 0.90f))
+                                .clickable { showTeamExpanded = !showTeamExpanded }
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = String.format(java.util.Locale.US, "Est %.1f ▾", verdict.teamEstimator),
+                                color = Color(0xFF1A1C20),
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
                     if (banner.match.alternateForms.size > 1) {
-                        val currentFormLabel = banner.match.species.formLabel() ?: "Base"
+                        val currentFormLabel = banner.match.species.formLabel() ?: "Form"
                         Box(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(999.dp))
                                 .background(Color.White.copy(alpha = 0.92f))
                                 .clickable { showFormSelector = !showFormSelector }
-                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
                         ) {
                             Text(
                                 text = "$currentFormLabel ▾",
                                 color = Color(0xFF1A1C20),
-                                fontSize = 11.sp,
+                                fontSize = 9.sp,
                                 fontWeight = FontWeight.Bold
                             )
                         }
-                        Spacer(modifier = Modifier.width(6.dp))
                     }
 
-                    // ✕ dismiss button
                     Box(
                         contentAlignment = Alignment.Center,
                         modifier = Modifier
-                            .size(26.dp)
+                            .size(20.dp)
                             .clip(CircleShape)
                             .background(Color.Black.copy(alpha = 0.18f))
                             .clickable { onDismiss() }
@@ -1263,7 +1324,7 @@ private fun PriorityWeaknessBannerOverlay(
                             imageVector = Icons.Default.Close,
                             contentDescription = "Dismiss Banner",
                             tint = headerContentColor,
-                            modifier = Modifier.size(15.dp)
+                            modifier = Modifier.size(12.dp)
                         )
                     }
                 }
@@ -1271,12 +1332,12 @@ private fun PriorityWeaknessBannerOverlay(
                 // Inline expandable form switcher row
                 AnimatedVisibility(visible = showFormSelector && banner.match.alternateForms.size > 1) {
                     FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
                         modifier = Modifier
                             .fillMaxWidth()
                             .background(Color(0xFFF7F8FA))
-                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                            .padding(horizontal = 8.dp, vertical = 5.dp)
                     ) {
                         banner.match.alternateForms.forEach { form ->
                             val isSelected = form.speciesId == banner.match.species.speciesId
@@ -1294,12 +1355,12 @@ private fun PriorityWeaknessBannerOverlay(
                                         onSelectForm(form)
                                         showFormSelector = false
                                     }
-                                    .padding(horizontal = 10.dp, vertical = 4.dp)
+                                    .padding(horizontal = 8.dp, vertical = 3.dp)
                             ) {
                                 Text(
                                     text = label,
                                     color = if (isSelected) Color(0xFFFFFFFF) else Color(0xFF1A1C20),
-                                    fontSize = 11.sp,
+                                    fontSize = 10.sp,
                                     fontWeight = FontWeight.SemiBold
                                 )
                             }
@@ -1307,85 +1368,104 @@ private fun PriorityWeaknessBannerOverlay(
                     }
                 }
 
-                // Pure-white body rendering WeaknessPriorityStrip (2.56× first, 1.6× second, Avoid toggle)
+                // Bare-minimum white weakness body: ONLY 2.56× and 1.6× multipliers + compact pills
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(Color(0xFFFFFFFF))
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                        .padding(horizontal = 8.dp, vertical = 5.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    WeaknessPriorityStrip(
-                        matchup = banner.matchup,
-                        showAvoidExpanded = showAvoidExpanded,
-                        onToggleAvoid = { showAvoidExpanded = !showAvoidExpanded }
-                    )
-
-                    if (savedPokemon.isNotEmpty()) {
-                        val verdict = remember(speciesId, savedPokemon, speciesById, movesById) {
-                            RaidBattleSimulator.simulatePersonalTeam(
-                                savedBox = savedPokemon,
-                                speciesById = speciesById,
-                                movesById = movesById,
-                                bossSpecies = banner.match.species,
-                                raidTier = 5
-                            )
-                        }
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(Color(0xFFF7F8FA))
-                                .clickable { showTeamExpanded = !showTeamExpanded }
-                                .padding(horizontal = 10.dp, vertical = 7.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                    if (banner.matchup.doubleWeaknesses.isNotEmpty()) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.fillMaxWidth()
                         ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(Color(0xFFFEE2E2))
+                                    .padding(horizontal = 5.dp, vertical = 2.dp)
                             ) {
                                 Text(
-                                    text = "My Best Team: ${verdict.verdictLabel}",
-                                    color = Color(0xFF1A1C20),
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = if (showTeamExpanded) "Hide ▲" else "${String.format(java.util.Locale.US, "Est %.2f", verdict.teamEstimator)} ▾",
-                                    color = Color(0xFF6E7582),
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold
+                                    text = "2.56×",
+                                    color = Color(0xFF991B1B),
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.ExtraBold
                                 )
                             }
-                            if (showTeamExpanded) {
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                banner.matchup.doubleWeaknesses.forEach { m ->
+                                    TypeChip(type = m.attackType, compact = true)
+                                }
+                            }
+                        }
+                    }
+
+                    if (banner.matchup.singleWeaknesses.isNotEmpty()) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(Color(0xFFFEF3C7))
+                                    .padding(horizontal = 5.dp, vertical = 2.dp)
+                            ) {
+                                Text(
+                                    text = "1.6×",
+                                    color = Color(0xFF92400E),
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                            }
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                banner.matchup.singleWeaknesses.forEach { m ->
+                                    TypeChip(type = m.attackType, compact = true)
+                                }
+                            }
+                        }
+                    }
+
+                    if (showTeamExpanded && verdict != null) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                                .padding(top = 2.dp),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            verdict.team.forEach { member ->
                                 Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
                                     modifier = Modifier
-                                        .fillMaxWidth()
-                                        .horizontalScroll(rememberScrollState()),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(Color(0xFFF7F8FA))
+                                        .padding(horizontal = 6.dp, vertical = 3.dp)
                                 ) {
-                                    verdict.team.forEach { member ->
-                                        Column(
-                                            horizontalAlignment = Alignment.CenterHorizontally,
-                                            modifier = Modifier
-                                                .clip(RoundedCornerShape(10.dp))
-                                                .background(Color.White)
-                                                .padding(horizontal = 8.dp, vertical = 4.dp)
-                                        ) {
-                                            PokemonSprite(
-                                                spriteFile = member.species.spriteFile,
-                                                contentDescription = member.species.speciesName,
-                                                size = 28.dp
-                                            )
-                                            Text(
-                                                text = "CP ${member.pokemon.cp}",
-                                                color = Color(0xFF1A1C20),
-                                                fontSize = 10.sp,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                        }
-                                    }
+                                    PokemonSprite(
+                                        spriteFile = member.species.spriteFile,
+                                        contentDescription = member.species.speciesName,
+                                        size = 20.dp
+                                    )
+                                    Text(
+                                        text = "${member.pokemon.cp}",
+                                        color = Color(0xFF1A1C20),
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
                                 }
                             }
                         }
@@ -1822,37 +1902,44 @@ private fun QuickDrawerOverlay(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun PendingPokemonSaveOverlay(
     detected: DetectedOwnPokemon,
     movesById: Map<String, MoveData>,
     onSave: (SavedPokemon) -> Unit,
+    onBeginFollowUpScan: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    var selectedSpecies by remember(detected) { mutableStateOf(detected.species) }
+    var cpText by remember(detected) { mutableStateOf(detected.cp?.toString() ?: "") }
     var ivAtk by remember(detected) { mutableIntStateOf(detected.ivAtk ?: 12) }
     var ivDef by remember(detected) { mutableIntStateOf(detected.ivDef ?: 12) }
     var ivSta by remember(detected) { mutableIntStateOf(detected.ivSta ?: 12) }
 
-    val solvedLevel = remember(detected, ivAtk, ivDef, ivSta) {
-        PokemonMathEngine.solveLevel(
-            baseAtk = detected.species.baseAtk,
-            baseDef = detected.species.baseDef,
-            baseSta = detected.species.baseSta,
-            ivAtk = ivAtk,
-            ivDef = ivDef,
-            ivSta = ivSta,
-            cp = detected.cp,
-            hp = detected.hp,
-            powerUpDust = detected.powerUpDust,
-            isShadow = detected.isShadow,
-            isPurified = detected.isPurified,
-            isLucky = detected.isLucky
-        )
+    val cpInt = cpText.toIntOrNull()
+    val solvedLevel = remember(selectedSpecies, cpInt, detected.hp, detected.powerUpDust, ivAtk, ivDef, ivSta) {
+        if (cpInt != null && cpInt > 0) {
+            PokemonMathEngine.solveLevel(
+                baseAtk = selectedSpecies.baseAtk,
+                baseDef = selectedSpecies.baseDef,
+                baseSta = selectedSpecies.baseSta,
+                ivAtk = ivAtk,
+                ivDef = ivDef,
+                ivSta = ivSta,
+                cp = cpInt,
+                hp = detected.hp,
+                powerUpDust = detected.powerUpDust,
+                isShadow = detected.isShadow,
+                isPurified = detected.isPurified,
+                isLucky = detected.isLucky
+            )
+        } else 20.0
     }
 
-    val moveEval = remember(detected, movesById) {
+    val moveEval = remember(selectedSpecies, detected.fastMove, detected.chargedMove1, detected.chargedMove2, movesById) {
         RaidBattleSimulator.evaluateMoveset(
-            species = detected.species,
+            species = selectedSpecies,
             movesById = movesById,
             currentFastId = detected.fastMove?.moveId,
             currentCharged1Id = detected.chargedMove1?.moveId,
@@ -1867,7 +1954,7 @@ private fun PendingPokemonSaveOverlay(
             .padding(horizontal = 16.dp, vertical = 20.dp)
     ) {
         Surface(
-            shape = RoundedCornerShape(22.dp),
+            shape = RoundedCornerShape(20.dp),
             color = Color.White,
             border = BorderStroke(1.dp, Color(0xFFECEFF4)),
             shadowElevation = 14.dp,
@@ -1876,8 +1963,8 @@ private fun PendingPokemonSaveOverlay(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -1886,23 +1973,32 @@ private fun PendingPokemonSaveOverlay(
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        modifier = Modifier.weight(1f)
                     ) {
                         PokemonSprite(
-                            spriteFile = detected.species.spriteFile,
-                            contentDescription = detected.species.speciesName,
-                            size = 42.dp
+                            spriteFile = selectedSpecies.spriteFile,
+                            contentDescription = selectedSpecies.speciesName,
+                            size = 40.dp
                         )
                         Column {
                             Text(
-                                text = "Save ${detected.species.speciesName}",
+                                text = selectedSpecies.speciesName,
                                 color = Color(0xFF1A1C20),
                                 fontSize = 15.sp,
-                                fontWeight = FontWeight.ExtraBold
+                                fontWeight = FontWeight.ExtraBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
+                            val subParts = buildList {
+                                detected.nickname?.let { add("\"$it\"") }
+                                add(if (cpInt != null) "CP $cpInt" else "CP needed")
+                                add("Lv ${formatLevel(solvedLevel)}")
+                                if (detected.isShadow) add("Shadow")
+                            }
                             Text(
-                                text = "CP ${detected.cp} • Lv ${formatLevel(solvedLevel)}${if (detected.isShadow) " • Shadow" else ""}",
-                                color = Color(0xFF6E7582),
+                                text = subParts.joinToString(" • "),
+                                color = if (cpInt == null) Color(0xFFD97706) else Color(0xFF6E7582),
                                 fontSize = 11.sp
                             )
                         }
@@ -1911,6 +2007,51 @@ private fun PendingPokemonSaveOverlay(
                         Icon(Icons.Default.Close, contentDescription = "Close", tint = Color(0xFF1A1C20))
                     }
                 }
+
+                // Form selector when multiple forms exist (e.g. Kyurem / Black / White, Zacian Crowned)
+                if (detected.alternateForms.size > 1) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        detected.alternateForms.forEach { form ->
+                            val isSel = form.speciesId == selectedSpecies.speciesId
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(999.dp))
+                                    .background(if (isSel) Color(0xFF1A1C20) else Color(0xFFF7F8FA))
+                                    .border(1.dp, Color(0xFFECEFF4), RoundedCornerShape(999.dp))
+                                    .clickable { selectedSpecies = form }
+                                    .padding(horizontal = 8.dp, vertical = 3.dp)
+                            ) {
+                                Text(
+                                    text = form.formLabel() ?: "Standard",
+                                    color = if (isSel) Color.White else Color(0xFF1A1C20),
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Editable CP box (prompts clearly if CP was covered by the Pokémon model)
+                OutlinedTextField(
+                    value = cpText,
+                    onValueChange = { cpText = it.filter(Char::isDigit).take(4) },
+                    label = {
+                        Text(
+                            if (detected.cp == null) "Enter CP (not visible on screen)" else "CP (edit if misread)",
+                            fontSize = 11.sp
+                        )
+                    },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
 
                 val moveLine = listOfNotNull(
                     detected.fastMove?.displayName,
@@ -1940,14 +2081,32 @@ private fun PendingPokemonSaveOverlay(
                 }
 
                 Text(
-                    text = if (detected.ivAtk != null) "Detected Appraisal IVs: $ivAtk/$ivDef/$ivSta" else "Confirm IVs: $ivAtk / $ivDef / $ivSta",
-                    color = Color(0xFF1A1C20),
-                    fontSize = 12.sp,
+                    text = if (detected.ivAtk != null) {
+                        "Appraisal IVs: $ivAtk / $ivDef / $ivSta"
+                    } else {
+                        "IVs not scanned (open Appraisal & tap Scan, or set): $ivAtk/$ivDef/$ivSta"
+                    },
+                    color = if (detected.ivAtk != null) Color(0xFF16A34A) else Color(0xFF1A1C20),
+                    fontSize = 11.sp,
                     fontWeight = FontWeight.Bold
                 )
                 OverlayIvRow("Atk", ivAtk) { ivAtk = it }
                 OverlayIvRow("Def", ivDef) { ivDef = it }
                 OverlayIvRow("Sta", ivSta) { ivSta = it }
+
+                if (detected.fastMove == null || detected.ivAtk == null || detected.cp == null) {
+                    val promptLabel = when {
+                        detected.fastMove == null -> "Scroll down to Moves & tap 📷"
+                        else -> "Scroll up to Appraisal/CP & tap 📷"
+                    }
+                    OutlinedButton(
+                        onClick = onBeginFollowUpScan,
+                        shape = RoundedCornerShape(999.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(promptLabel, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
 
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1962,13 +2121,15 @@ private fun PendingPokemonSaveOverlay(
                     }
                     Button(
                         onClick = {
+                            val validCp = cpInt ?: return@Button
                             onSave(
                                 SavedPokemon(
                                     id = UUID.randomUUID().toString(),
-                                    speciesId = detected.species.speciesId,
-                                    pokebattlerId = detected.species.pokebattlerId
-                                        ?: detected.species.speciesId.uppercase(),
-                                    cp = detected.cp,
+                                    speciesId = selectedSpecies.speciesId,
+                                    pokebattlerId = selectedSpecies.pokebattlerId
+                                        ?: selectedSpecies.speciesId.uppercase(),
+                                    nickname = detected.nickname,
+                                    cp = validCp,
                                     hp = detected.hp,
                                     ivAtk = ivAtk,
                                     ivDef = ivDef,
@@ -1977,7 +2138,7 @@ private fun PendingPokemonSaveOverlay(
                                     isShadow = detected.isShadow,
                                     isPurified = detected.isPurified,
                                     isLucky = detected.isLucky,
-                                    isMegaCapable = detected.species.tags.contains("mega"),
+                                    isMegaCapable = selectedSpecies.tags.contains("mega"),
                                     fastMoveId = detected.fastMove?.moveId,
                                     chargedMove1Id = detected.chargedMove1?.moveId,
                                     chargedMove2Id = detected.chargedMove2?.moveId,
@@ -1985,6 +2146,7 @@ private fun PendingPokemonSaveOverlay(
                                 )
                             )
                         },
+                        enabled = cpInt != null && cpInt > 0,
                         shape = RoundedCornerShape(999.dp),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = Color(0xFF1A1C20),

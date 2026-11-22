@@ -1,7 +1,9 @@
 package com.pogooverlay.app.core.data
 
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 class PokemonNameMatcher(
     private val allSpecies: List<PokemonSpecies>
@@ -16,10 +18,37 @@ class PokemonNameMatcher(
     private data class CandidateMatch(
         val species: PokemonSpecies,
         val isExplicitForm: Boolean,
+        val exactRank: Int,
+        val similarity: Float,
         val confidence: Float,
         val aliasLength: Int,
-        val detectedPrefix: String?
+        val detectedPrefix: String?,
+        val isActiveRaidMatch: Boolean
     )
+
+    private data class CandidateScore(
+        val exactRank: Int,
+        val similarityBucket: Int,
+        val explicitFormRank: Int,
+        val activeRaidRank: Int,
+        val aliasLength: Int,
+        val prefixRank: Int,
+        val baseFormTieBreak: Int,
+        val dexTieBreak: Int
+    ) : Comparable<CandidateScore> {
+        override fun compareTo(other: CandidateScore): Int = compareValuesBy(
+            this,
+            other,
+            { it.exactRank },
+            { it.similarityBucket },
+            { it.explicitFormRank },
+            { it.activeRaidRank },
+            { it.aliasLength },
+            { it.prefixRank },
+            { it.baseFormTieBreak },
+            { it.dexTieBreak }
+        )
+    }
 
     private val formsByDex: Map<Int, List<PokemonSpecies>> = allSpecies
         .groupBy { it.dex }
@@ -93,40 +122,51 @@ class PokemonNameMatcher(
             addAll(rawLines)
         }.distinct()
 
-        var bestMatch: CandidateMatch? = null
-
-        for (segment in candidatesToScan) {
-            val cleaned = cleanOcrSegment(segment)
-            if (cleaned.normalizedText.isBlank()) continue
-
-            val exact = findExactMatch(cleaned.normalizedText, cleaned.detectedPrefix)
-            if (exact != null && isBetterCandidate(exact, bestMatch)) {
-                bestMatch = exact
-                // Early exit on perfect full-string explicit form match
-                if (exact.confidence >= 0.99f && exact.isExplicitForm) {
-                    break
-                }
+        val activeRaidSpecies = if (activeRaids.isEmpty()) {
+            emptyList()
+        } else {
+            activeRaids.mapNotNull { raid ->
+                matchText(raid.name, activeRaids = emptyList())?.species
             }
         }
+        val activeRaidSpeciesIds = activeRaidSpecies.mapTo(HashSet()) { it.speciesId }
 
-        // Fallback to edit-distance fuzzy matching if no exact match found
-        if (bestMatch == null) {
-            for (segment in candidatesToScan) {
-                val cleaned = cleanOcrSegment(segment)
-                if (cleaned.normalizedText.isBlank()) continue
+        val cleanedSegments = candidatesToScan
+            .map { cleanOcrSegment(it) }
+            .filter { it.normalizedText.isNotBlank() }
 
-                val fuzzy = findFuzzyMatch(cleaned.normalizedText, cleaned.detectedPrefix)
-                if (fuzzy != null && isBetterCandidate(fuzzy, bestMatch)) {
-                    bestMatch = fuzzy
-                }
+        if (cleanedSegments.isEmpty()) return null
+
+        val exactCandidates = ArrayList<CandidateMatch>()
+        for (cleaned in cleanedSegments) {
+            findExactCandidates(
+                normalizedText = cleaned.normalizedText,
+                detectedPrefix = cleaned.detectedPrefix,
+                activeRaidSpeciesIds = activeRaidSpeciesIds,
+                out = exactCandidates
+            )
+        }
+
+        val bestMatch: CandidateMatch? = if (exactCandidates.isNotEmpty()) {
+            exactCandidates.maxByOrNull { scoreCandidate(it) }
+        } else {
+            val fuzzyCandidates = ArrayList<CandidateMatch>()
+            for (cleaned in cleanedSegments) {
+                findFuzzyCandidates(
+                    normalizedText = cleaned.normalizedText,
+                    detectedPrefix = cleaned.detectedPrefix,
+                    activeRaidSpeciesIds = activeRaidSpeciesIds,
+                    out = fuzzyCandidates
+                )
             }
+            fuzzyCandidates.maxByOrNull { scoreCandidate(it) }
         }
 
         val winner = bestMatch ?: return null
 
         // Active raid disambiguation when OCR detected a base/ambiguous name without an explicit form modifier
-        val resolvedSpecies = if (!winner.isExplicitForm && activeRaids.isNotEmpty()) {
-            disambiguateWithActiveRaids(winner.species, activeRaids)
+        val resolvedSpecies = if (!winner.isExplicitForm && activeRaidSpecies.isNotEmpty()) {
+            disambiguateWithActiveRaids(winner.species, activeRaidSpecies)
         } else {
             winner.species
         }
@@ -211,56 +251,67 @@ class PokemonNameMatcher(
         return best
     }
 
-    private fun findExactMatch(
+    private fun findExactCandidates(
         normalizedText: String,
-        detectedPrefix: String?
-    ): CandidateMatch? {
-        // 1. Direct full-string match
-        aliasMap[normalizedText]?.firstOrNull()?.let { entry ->
-            return CandidateMatch(
-                species = entry.species,
-                isExplicitForm = entry.isExplicitForm,
-                confidence = 1.0f,
-                aliasLength = entry.alias.length,
-                detectedPrefix = detectedPrefix
+        detectedPrefix: String?,
+        activeRaidSpeciesIds: Set<String>,
+        out: MutableList<CandidateMatch>
+    ) {
+        // 1. Direct full-string match (evaluates ALL entries for this alias, never firstOrNull)
+        aliasMap[normalizedText]?.forEach { entry ->
+            out.add(
+                CandidateMatch(
+                    species = entry.species,
+                    isExplicitForm = entry.isExplicitForm,
+                    exactRank = 2,
+                    similarity = 1.0f,
+                    confidence = 1.0f,
+                    aliasLength = entry.alias.length,
+                    detectedPrefix = detectedPrefix,
+                    isActiveRaidMatch = entry.species.speciesId in activeRaidSpeciesIds
+                )
             )
         }
 
-        // 2. Sliding n-gram window over tokens (prefer longer / explicit-form windows)
+        // 2. Sliding n-gram window over tokens (evaluates ALL entries for every matching slice)
         val tokens = normalizedText.split(' ').filter { it.isNotBlank() }
-        if (tokens.isEmpty()) return null
+        if (tokens.isEmpty()) return
 
-        var best: CandidateMatch? = null
         val maxWindow = min(tokens.size, 5)
         for (windowSize in maxWindow downTo 1) {
             for (start in 0..(tokens.size - windowSize)) {
                 val slice = tokens.subList(start, start + windowSize).joinToString(" ")
-                val hit = aliasMap[slice]?.firstOrNull() ?: continue
+                if (slice == normalizedText) continue
+                val entries = aliasMap[slice] ?: continue
 
-                // If prefix appeared immediately before this slice inside a multi-token line, keep it
                 val ratio = slice.length.toFloat() / normalizedText.length.toFloat()
                 val confidence = (0.90f + 0.09f * ratio).coerceAtMost(0.99f)
-                val candidate = CandidateMatch(
-                    species = hit.species,
-                    isExplicitForm = hit.isExplicitForm,
-                    confidence = confidence,
-                    aliasLength = hit.alias.length,
-                    detectedPrefix = detectedPrefix
-                )
-                if (isBetterCandidate(candidate, best)) {
-                    best = candidate
+                for (entry in entries) {
+                    out.add(
+                        CandidateMatch(
+                            species = entry.species,
+                            isExplicitForm = entry.isExplicitForm,
+                            exactRank = 1,
+                            similarity = ratio,
+                            confidence = confidence,
+                            aliasLength = entry.alias.length,
+                            detectedPrefix = detectedPrefix,
+                            isActiveRaidMatch = entry.species.speciesId in activeRaidSpeciesIds
+                        )
+                    )
                 }
             }
         }
-        return best
     }
 
-    private fun findFuzzyMatch(
+    private fun findFuzzyCandidates(
         normalizedText: String,
-        detectedPrefix: String?
-    ): CandidateMatch? {
+        detectedPrefix: String?,
+        activeRaidSpeciesIds: Set<String>,
+        out: MutableList<CandidateMatch>
+    ) {
         val tokens = normalizedText.split(' ').filter { it.isNotBlank() }
-        if (tokens.isEmpty()) return null
+        if (tokens.isEmpty()) return
 
         val windows = LinkedHashSet<String>()
         val maxWindow = min(tokens.size, 4)
@@ -277,20 +328,23 @@ class PokemonNameMatcher(
             }
         }
 
-        var best: CandidateMatch? = null
         for (window in windows) {
             // Check exact hit after OCR digit substitution (e.g. "mewtw0" -> "mewtwo")
-            val exactFixed = aliasMap[window]?.firstOrNull()
-            if (exactFixed != null) {
-                val candidate = CandidateMatch(
-                    species = exactFixed.species,
-                    isExplicitForm = exactFixed.isExplicitForm,
-                    confidence = 0.94f,
-                    aliasLength = exactFixed.alias.length,
-                    detectedPrefix = detectedPrefix
-                )
-                if (isBetterCandidate(candidate, best)) {
-                    best = candidate
+            val exactFixedEntries = aliasMap[window]
+            if (!exactFixedEntries.isNullOrEmpty()) {
+                for (entry in exactFixedEntries) {
+                    out.add(
+                        CandidateMatch(
+                            species = entry.species,
+                            isExplicitForm = entry.isExplicitForm,
+                            exactRank = 0,
+                            similarity = 0.95f,
+                            confidence = 0.94f,
+                            aliasLength = entry.alias.length,
+                            detectedPrefix = detectedPrefix,
+                            isActiveRaidMatch = entry.species.speciesId in activeRaidSpeciesIds
+                        )
+                    )
                 }
                 continue
             }
@@ -303,40 +357,39 @@ class PokemonNameMatcher(
 
             for (entry in allAliases) {
                 val target = entry.alias
-                if (kotlin.math.abs(target.length - window.length) > maxAllowedDist) continue
                 if (target.length < 4) continue
+                if (abs(target.length - window.length) > maxAllowedDist) continue
 
                 val dist = levenshtein(window, target)
                 if (dist > maxAllowedDist) continue
 
                 val maxLen = max(window.length, target.length).toFloat()
                 val similarity = 1f - (dist.toFloat() / maxLen)
-                if (similarity < 0.75f) continue
+                if (similarity < MIN_FUZZY_SIMILARITY) continue
 
-                val confidence = (0.70f + (similarity - 0.75f) * 0.88f).coerceIn(0.70f, 0.92f)
-                val candidate = CandidateMatch(
-                    species = entry.species,
-                    isExplicitForm = entry.isExplicitForm,
-                    confidence = confidence,
-                    aliasLength = target.length,
-                    detectedPrefix = detectedPrefix
+                val confidence = (0.78f + (similarity - MIN_FUZZY_SIMILARITY) * (0.14f / (1f - MIN_FUZZY_SIMILARITY)))
+                    .coerceIn(0.78f, 0.92f)
+                out.add(
+                    CandidateMatch(
+                        species = entry.species,
+                        isExplicitForm = entry.isExplicitForm,
+                        exactRank = 0,
+                        similarity = similarity,
+                        confidence = confidence,
+                        aliasLength = target.length,
+                        detectedPrefix = detectedPrefix,
+                        isActiveRaidMatch = entry.species.speciesId in activeRaidSpeciesIds
+                    )
                 )
-                if (isBetterCandidate(candidate, best)) {
-                    best = candidate
-                }
             }
         }
-        return best
     }
 
     private fun disambiguateWithActiveRaids(
         baseMatch: PokemonSpecies,
-        activeRaids: List<RaidBossEntry>
+        activeRaidSpecies: List<PokemonSpecies>
     ): PokemonSpecies {
-        val matchingRaidSpecies = activeRaids.mapNotNull { raid ->
-            matchText(raid.name, activeRaids = emptyList())?.species
-        }.filter { it.dex == baseMatch.dex }
-
+        val matchingRaidSpecies = activeRaidSpecies.filter { it.dex == baseMatch.dex }
         if (matchingRaidSpecies.isEmpty()) return baseMatch
 
         // If the exact base form itself is currently in active raids, keep it
@@ -348,29 +401,17 @@ class PokemonNameMatcher(
         return matchingRaidSpecies.first()
     }
 
-    private fun isBetterCandidate(candidate: CandidateMatch, current: CandidateMatch?): Boolean {
-        if (current == null) return true
-        if (candidate.isExplicitForm != current.isExplicitForm) {
-            // Prefer explicit form when confidence is comparable
-            if (candidate.isExplicitForm && candidate.confidence >= current.confidence - 0.08f) {
-                return true
-            }
-            if (current.isExplicitForm && current.confidence >= candidate.confidence - 0.08f) {
-                return false
-            }
-        }
-        if (candidate.aliasLength != current.aliasLength &&
-            kotlin.math.abs(candidate.confidence - current.confidence) < 0.06f
-        ) {
-            return candidate.aliasLength > current.aliasLength
-        }
-        if (candidate.confidence != current.confidence) {
-            return candidate.confidence > current.confidence
-        }
-        if (candidate.detectedPrefix != null && current.detectedPrefix == null) {
-            return true
-        }
-        return candidate.aliasLength > current.aliasLength
+    private fun scoreCandidate(candidate: CandidateMatch): CandidateScore {
+        return CandidateScore(
+            exactRank = candidate.exactRank,
+            similarityBucket = (candidate.similarity * 10_000f).roundToInt(),
+            explicitFormRank = if (candidate.isExplicitForm) 1 else 0,
+            activeRaidRank = if (candidate.isActiveRaidMatch) 1 else 0,
+            aliasLength = candidate.aliasLength,
+            prefixRank = if (candidate.detectedPrefix != null) 1 else 0,
+            baseFormTieBreak = -formPriority(candidate.species.formLabel()),
+            dexTieBreak = -candidate.species.dex
+        )
     }
 
     private data class CleanedSegment(
@@ -518,6 +559,7 @@ class PokemonNameMatcher(
     }
 
     companion object {
+        private const val MIN_FUZZY_SIMILARITY = 0.82f
         private val TIMER_REGEX = Regex("""\b\d{1,2}:\d{2}(?::\d{2})?\b|\b\d{1,3}s\b""", RegexOption.IGNORE_CASE)
         private val CP_REGEX = Regex("""\bc\.?p\.?\s*[:\-]?\s*[\d,?]+\b|\b\d{3,6}\s*cp\b""", RegexOption.IGNORE_CASE)
         private val HP_REGEX = Regex("""\bh\.?p\.?\s*[:\-]?\s*[\d,/]+\b|\b\d+\s*/\s*\d+\s*hp\b""", RegexOption.IGNORE_CASE)

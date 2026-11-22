@@ -19,8 +19,15 @@ data class OcrLine(
     val text: String,
     val normalizedTop: Float,
     val normalizedLeft: Float,
-    val normalizedHeight: Float
-)
+    val normalizedHeight: Float,
+    val normalizedWidth: Float = 0f
+) {
+    val normalizedBottom: Float
+        get() = (normalizedTop + normalizedHeight).coerceIn(0f, 1f)
+
+    val normalizedRight: Float
+        get() = (normalizedLeft + normalizedWidth).coerceIn(0f, 1f)
+}
 
 class OcrPipeline {
 
@@ -91,7 +98,8 @@ class OcrPipeline {
                             text = trimmed,
                             normalizedTop = (absTop.toFloat() / fullHeight.toFloat()).coerceIn(0f, 1f),
                             normalizedLeft = (absLeft.toFloat() / fullWidth.toFloat()).coerceIn(0f, 1f),
-                            normalizedHeight = (heightPx.toFloat() / fullHeight.toFloat()).coerceIn(0f, 1f)
+                            normalizedHeight = (heightPx.toFloat() / fullHeight.toFloat()).coerceIn(0f, 1f),
+                            normalizedWidth = ((box?.width() ?: 0).coerceAtLeast(1).toFloat() / fullWidth.toFloat()).coerceIn(0f, 1f)
                         )
                     )
                 }

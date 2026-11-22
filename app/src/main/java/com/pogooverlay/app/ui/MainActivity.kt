@@ -30,6 +30,11 @@ import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
+    companion object {
+        private const val PREFS_NAME = "pogo_overlay_prefs"
+        private const val KEY_DEBUG_ANNOTATED_CAPTURE = "debug_annotated_capture"
+    }
+
     private var hasOverlayPermission by mutableStateOf(false)
     private var hasNotificationPermission by mutableStateOf(true)
 
@@ -57,6 +62,11 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         refreshPermissionFlags()
+
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        OverlayStateHolder.setDebugSaveAnnotatedCapture(
+            prefs.getBoolean(KEY_DEBUG_ANNOTATED_CAPTURE, false)
+        )
 
         val repository = PoGoOverlayApp.instance.repository
         val pokeboxRepository = PoGoOverlayApp.instance.pokeboxRepository
@@ -100,6 +110,10 @@ class MainActivity : ComponentActivity() {
                     onDeletePokemon = { pokeboxRepository.deletePokemon(it) },
                     onRequestOverlayPermission = ::launchOverlayPermissionSettings,
                     onRequestNotificationPermission = ::requestNotificationPermissionIfNeeded,
+                    onToggleDebugAnnotatedCapture = { enabled ->
+                        prefs.edit().putBoolean(KEY_DEBUG_ANNOTATED_CAPTURE, enabled).apply()
+                        OverlayStateHolder.setDebugSaveAnnotatedCapture(enabled)
+                    },
                     onActivateOverlay = ::activateOverlayWithCapture,
                     onStartManualOnly = ::startManualOnlyOverlay,
                     onStopOverlay = { OverlayService.stop(this) },

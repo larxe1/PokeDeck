@@ -162,7 +162,7 @@ fun PokeboxTabContent(
                         fontWeight = FontWeight.Bold,
                     )
                     Text(
-                        text = "Tap + Add above, or tap 📷 / Scan Pokémon in the overlay while viewing one of your Pokémon in-game to auto-save CP, level, moveset, and IVs.",
+                        text = "Tap + Add above, or switch the overlay pill to Scan mode and tap 📷 on both the Appraisal screen and Moveset (in any order) to save exact IVs, level, and moves.",
                         color = PokedexMuted,
                         fontSize = 12.sp,
                         lineHeight = 17.sp,

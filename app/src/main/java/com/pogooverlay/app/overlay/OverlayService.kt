@@ -11,11 +11,15 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
@@ -27,11 +31,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.material3.Button
-import androidx.compose.material3.Slider
-import java.util.UUID
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -49,9 +48,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Close
@@ -69,7 +69,6 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -83,7 +82,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -92,27 +90,34 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.pogooverlay.app.PoGoOverlayApp
 import com.pogooverlay.app.R
+import com.pogooverlay.app.core.capture.CaptureDebugAnnotator
+import com.pogooverlay.app.core.capture.CaptureDebugOverlayData
 import com.pogooverlay.app.core.capture.ScreenCaptureEngine
 import com.pogooverlay.app.core.data.ActiveBossBanner
+import com.pogooverlay.app.core.data.OverlayMode
 import com.pogooverlay.app.core.data.OverlayRuntimeState
 import com.pogooverlay.app.core.data.OverlayStateHolder
 import com.pogooverlay.app.core.data.PokemonRepository
 import com.pogooverlay.app.core.data.PokemonSpecies
 import com.pogooverlay.app.core.data.PokemonType
 import com.pogooverlay.app.core.data.RaidBossEntry
-import com.pogooverlay.app.core.data.ScanMode
+import com.pogooverlay.app.core.data.RaidCardTab
 import com.pogooverlay.app.core.data.TypeEffectivenessChart
-import com.pogooverlay.app.core.detector.DetectedOwnPokemon
-import com.pogooverlay.app.core.detector.MyPokemonDetector
+import com.pogooverlay.app.core.detector.CapturePipelineRouter
+import com.pogooverlay.app.core.detector.CaptureRouteResult
 import com.pogooverlay.app.core.detector.RaidBossDetector
-import com.pogooverlay.app.core.detector.ScreenClassifier
-import com.pogooverlay.app.core.detector.ScreenKind
+import com.pogooverlay.app.core.detector.RaidCaptureAction
+import com.pogooverlay.app.core.detector.RaidFlowCoordinator
+import com.pogooverlay.app.core.ocr.OcrLine
 import com.pogooverlay.app.core.ocr.OcrPipeline
 import com.pogooverlay.app.core.pokebox.MoveData
 import com.pogooverlay.app.core.pokebox.PokeboxRepository
-import com.pogooverlay.app.core.pokebox.PokemonMathEngine
 import com.pogooverlay.app.core.pokebox.RaidBattleSimulator
 import com.pogooverlay.app.core.pokebox.SavedPokemon
+import com.pogooverlay.app.core.scan.AppraisalIvParseResult
+import com.pogooverlay.app.core.scan.CaptureSessionManager
+import com.pogooverlay.app.core.scan.CaptureStepOutcome
+import com.pogooverlay.app.core.scan.ScanScreenParser
 import com.pogooverlay.app.ui.MainActivity
 import com.pogooverlay.app.ui.components.PokemonSprite
 import com.pogooverlay.app.ui.components.TypeChip
@@ -120,7 +125,6 @@ import com.pogooverlay.app.ui.components.TypeDot
 import com.pogooverlay.app.ui.components.WeaknessPriorityStrip
 import com.pogooverlay.app.ui.components.badgeColor
 import com.pogooverlay.app.ui.components.contentColor
-import com.pogooverlay.app.ui.pokebox.formatLevel
 import com.pogooverlay.app.ui.theme.PoGoOverlayTheme
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -131,9 +135,11 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.withContext
+import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 class OverlayService : Service() {
@@ -141,7 +147,10 @@ class OverlayService : Service() {
     companion object {
         private const val NOTIFICATION_CHANNEL_ID = "pogo_raid_overlay_channel"
         private const val NOTIFICATION_ID = 4101
-        private const val AUTO_WATCH_INTERVAL_MS = 1500L
+        private const val CAPTURE_HIDE_DELAY_MS = 100L
+        private const val TRANSIENT_MESSAGE_MS = 3000L
+        private const val PREFS_NAME = "pogo_overlay_prefs"
+        private const val KEY_DEBUG_ANNOTATED_CAPTURE = "debug_annotated_capture"
 
         const val ACTION_START = "com.pogooverlay.app.action.START_OVERLAY"
         const val ACTION_STOP = "com.pogooverlay.app.action.STOP_OVERLAY"
@@ -173,7 +182,7 @@ class OverlayService : Service() {
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val scanMutex = Mutex()
+    private val captureMutex = Mutex()
 
     private lateinit var windowManager: WindowManager
     private lateinit var repository: PokemonRepository
@@ -181,7 +190,9 @@ class OverlayService : Service() {
     private lateinit var captureEngine: ScreenCaptureEngine
     private lateinit var ocrPipeline: OcrPipeline
     private lateinit var raidBossDetector: RaidBossDetector
-    private lateinit var myPokemonDetector: MyPokemonDetector
+    private lateinit var raidFlowCoordinator: RaidFlowCoordinator
+    private lateinit var scanScreenParser: ScanScreenParser
+    private lateinit var captureSessionManager: CaptureSessionManager
 
     private var pillLifecycleOwner: OverlayLifecycleOwner? = null
     private var bannerLifecycleOwner: OverlayLifecycleOwner? = null
@@ -195,11 +206,13 @@ class OverlayService : Service() {
     private var bannerParams: WindowManager.LayoutParams? = null
     private var drawerParams: WindowManager.LayoutParams? = null
 
-    private var autoWatchJob: Job? = null
     private var messageClearJob: Job? = null
 
     private val _isDrawerOpen = MutableStateFlow(false)
     private val isDrawerOpen: StateFlow<Boolean> = _isDrawerOpen.asStateFlow()
+
+    @Volatile
+    private var isHidingForCapture: Boolean = false
 
     @Volatile
     private var isScreenOn: Boolean = true
@@ -215,6 +228,7 @@ class OverlayService : Service() {
                         captureEngine.isScreenOn = false
                     }
                 }
+
                 Intent.ACTION_SCREEN_ON -> {
                     isScreenOn = true
                     if (::captureEngine.isInitialized) {
@@ -243,18 +257,17 @@ class OverlayService : Service() {
         }
         pokeboxRepository.ensureLoaded()
 
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        OverlayStateHolder.setDebugSaveAnnotatedCapture(
+            prefs.getBoolean(KEY_DEBUG_ANNOTATED_CAPTURE, false)
+        )
+
         isScreenOn = queryIsScreenInteractive()
 
         captureEngine = ScreenCaptureEngine(
             context = applicationContext,
             onProjectionStopped = {
-                OverlayStateHolder.update { state ->
-                    state.copy(
-                        hasMediaProjection = false,
-                        scanMode = ScanMode.BATTERY_SAVER_ONE_TAP,
-                        lastScanMessage = "Capture ended — Saver mode"
-                    )
-                }
+                stopOverlayService()
             }
         )
         captureEngine.isScreenOn = isScreenOn
@@ -264,10 +277,15 @@ class OverlayService : Service() {
             matcherProvider = { repository.getMatcher() },
             activeRaidsProvider = { repository.activeRaids.value }
         )
-        myPokemonDetector = MyPokemonDetector(
+        raidFlowCoordinator = RaidFlowCoordinator(raidBossDetector)
+        scanScreenParser = ScanScreenParser(
             matcherProvider = { repository.getMatcher() },
-            movesProvider = { pokeboxRepository.movesById.value },
-            activeRaidsProvider = { repository.activeRaids.value }
+            movesProvider = { pokeboxRepository.movesById.value }
+        )
+        captureSessionManager = CaptureSessionManager(
+            onSavePokemon = { saved ->
+                pokeboxRepository.savePokemon(saved)
+            }
         )
 
         registerScreenStateReceiver()
@@ -297,7 +315,8 @@ class OverlayService : Service() {
             hasNewProjectionGrant || captureEngine.hasActiveProjection
 
         // CRITICAL ANDROID 14/15 ORDER:
-        // Call ServiceCompat.startForeground(...) BEFORE calling mediaProjectionManager.getMediaProjection(...)
+        // Call startForegroundWithType(FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        // BEFORE calling mediaProjectionManager.getMediaProjection(resultCode, data)
         startForegroundWithType(useMediaProjectionForegroundType)
 
         if (!Settings.canDrawOverlays(this)) {
@@ -312,7 +331,6 @@ class OverlayService : Service() {
                 current.copy(
                     isRunning = true,
                     hasMediaProjection = started,
-                    scanMode = if (started) ScanMode.AUTO_WATCH else ScanMode.BATTERY_SAVER_ONE_TAP,
                     lastScanMessage = if (started) null else "Manual drawer mode"
                 )
             }
@@ -321,14 +339,12 @@ class OverlayService : Service() {
             OverlayStateHolder.update { current ->
                 current.copy(
                     isRunning = true,
-                    hasMediaProjection = alreadyCapturing,
-                    scanMode = if (alreadyCapturing) current.scanMode else ScanMode.BATTERY_SAVER_ONE_TAP
+                    hasMediaProjection = alreadyCapturing
                 )
             }
         }
 
         ensureOverlayWindowsAttached()
-        ensureAutoWatchLoop()
 
         return START_STICKY
     }
@@ -346,6 +362,7 @@ class OverlayService : Service() {
                         ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
                     )
                 }
+
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE -> {
                     ServiceCompat.startForeground(
                         this,
@@ -354,6 +371,7 @@ class OverlayService : Service() {
                         ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
                     )
                 }
+
                 else -> {
                     startForeground(NOTIFICATION_ID, notification)
                 }
@@ -443,14 +461,25 @@ class OverlayService : Service() {
                         onDrag = { dx, dy ->
                             updateEdgePillPosition(dx, dy)
                         },
-                        onToggleScanMode = {
-                            toggleScanMode()
+                        onToggleOverlayMode = {
+                            toggleOverlayMode()
                         },
-                        onOneTapScan = {
-                            triggerManualScan()
+                        onManualCapture = {
+                            triggerManualCapture()
                         },
                         onToggleDrawer = {
                             setDrawerOpen(!drawerOpen)
+                        },
+                        onTapStatusPill = { displayedMessage ->
+                            if (runtimeState.overlayMode == OverlayMode.RAID &&
+                                displayedMessage.contains("pick boss", ignoreCase = true)
+                            ) {
+                                OverlayStateHolder.clearScanMessage()
+                                setDrawerOpen(true)
+                            }
+                        },
+                        onDismissStatus = {
+                            handleDismissStatusPill()
                         }
                     )
                 }
@@ -497,22 +526,27 @@ class OverlayService : Service() {
                     val movesById by pokeboxRepository.movesById.collectAsState()
                     val allSpecies by repository.species.collectAsState()
                     val speciesById = remember(allSpecies) { allSpecies.associateBy { it.speciesId } }
-                    val banner = runtimeState.activeBanner
-                    if (banner != null) {
-                        PriorityWeaknessBannerOverlay(
+                    val banner = runtimeState.activeRaidBoss
+                    if (banner != null && runtimeState.isRaidCardVisible) {
+                        RaidOverlayCard(
                             banner = banner,
+                            activeTab = runtimeState.activeRaidTab,
                             savedPokemon = savedPokemon,
                             speciesById = speciesById,
                             movesById = movesById,
+                            onSelectTab = { tab ->
+                                OverlayStateHolder.setRaidCardTab(tab)
+                            },
                             onSelectForm = { selectedForm ->
-                                OverlayStateHolder.selectForm(
+                                val updatedMatch = OverlayStateHolder.selectForm(
                                     species = selectedForm,
                                     allForms = banner.match.alternateForms,
                                     detectedPrefix = banner.match.detectedPrefix
                                 )
+                                raidFlowCoordinator.setManualBoss(updatedMatch)
                             },
                             onDismiss = {
-                                OverlayStateHolder.dismissBanner()
+                                OverlayStateHolder.dismissRaidCard()
                             }
                         )
                     }
@@ -526,10 +560,12 @@ class OverlayService : Service() {
 
             serviceScope.launch {
                 OverlayStateHolder.state.collect { state ->
-                    val shouldBeVisible = state.activeBanner != null
-                    val targetVisibility = if (shouldBeVisible) View.VISIBLE else View.GONE
-                    if (view.visibility != targetVisibility) {
-                        view.visibility = targetVisibility
+                    if (!isHidingForCapture) {
+                        val shouldBeVisible = state.activeRaidBoss != null && state.isRaidCardVisible
+                        val targetVisibility = if (shouldBeVisible) View.VISIBLE else View.GONE
+                        if (view.visibility != targetVisibility) {
+                            view.visibility = targetVisibility
+                        }
                     }
                 }
             }
@@ -566,38 +602,15 @@ class OverlayService : Service() {
             setContent {
                 PoGoOverlayTheme {
                     val drawerOpen by isDrawerOpen.collectAsState()
-                    val runtimeState by OverlayStateHolder.state.collectAsState()
                     val activeRaids by repository.activeRaids.collectAsState()
                     val isRefreshing by repository.isRefreshing.collectAsState()
                     val allSpecies by repository.species.collectAsState()
-                    val movesById by pokeboxRepository.movesById.collectAsState()
 
-                    val pendingSave = runtimeState.pendingPokemonSave
-                    if (pendingSave != null && !runtimeState.awaitingFollowUpScan) {
-                        PendingPokemonSaveOverlay(
-                            detected = pendingSave,
-                            movesById = movesById,
-                            onSave = { saved ->
-                                pokeboxRepository.savePokemon(saved)
-                                OverlayStateHolder.dismissPendingPokemonSave()
-                                showTransientScanMessage("Saved ${saved.nickname ?: pendingSave.species.speciesName}")
-                            },
-                            onBeginFollowUpScan = {
-                                OverlayStateHolder.beginFollowUpPokemonScan()
-                            },
-                            onDismiss = {
-                                OverlayStateHolder.dismissPendingPokemonSave()
-                            }
-                        )
-                    } else if (drawerOpen) {
+                    if (drawerOpen) {
                         QuickDrawerOverlay(
                             activeRaids = activeRaids,
                             allSpecies = allSpecies,
                             isRefreshingRaids = isRefreshing,
-                            hasMediaProjection = runtimeState.hasMediaProjection,
-                            onScanOwnPokemon = {
-                                triggerScanMyPokemon()
-                            },
                             onRefreshRaids = {
                                 serviceScope.launch {
                                     repository.refreshLiveRaids()
@@ -606,13 +619,25 @@ class OverlayService : Service() {
                             onSelectRaidBoss = { raid ->
                                 val match = repository.getMatcher().matchText(raid.name, activeRaids)
                                 if (match != null) {
-                                    OverlayStateHolder.showMatchedBoss(match)
+                                    if (OverlayStateHolder.state.value.overlayMode != OverlayMode.RAID) {
+                                        captureSessionManager.reset()
+                                        OverlayStateHolder.setOverlayMode(OverlayMode.RAID)
+                                    }
+                                    raidFlowCoordinator.setManualBoss(match)
+                                    OverlayStateHolder.showRaidPreviewBoss(match)
+                                    scheduleTransientMessageClear("Detected ${match.displayTitle}")
                                     setDrawerOpen(false)
                                 }
                             },
                             onSelectSpecies = { species ->
                                 val forms = repository.getMatcher().getFormsForSpecies(species)
-                                OverlayStateHolder.showManualSpecies(species, forms)
+                                if (OverlayStateHolder.state.value.overlayMode != OverlayMode.RAID) {
+                                    captureSessionManager.reset()
+                                    OverlayStateHolder.setOverlayMode(OverlayMode.RAID)
+                                }
+                                val match = OverlayStateHolder.showManualSpecies(species, forms)
+                                raidFlowCoordinator.setManualBoss(match)
+                                scheduleTransientMessageClear("Selected ${match.displayTitle}")
                                 setDrawerOpen(false)
                             },
                             onSearchSpecies = { query ->
@@ -636,12 +661,6 @@ class OverlayService : Service() {
         try {
             windowManager.addView(view, params)
             drawerView = view
-            serviceScope.launch {
-                OverlayStateHolder.state.collect { state ->
-                    val showSaveModal = state.pendingPokemonSave != null && !state.awaitingFollowUpScan
-                    syncDrawerWindowVisibility(showSaveModal || _isDrawerOpen.value)
-                }
-            }
         } catch (_: Throwable) {
             owner.performDestroy()
             drawerLifecycleOwner = null
@@ -650,9 +669,16 @@ class OverlayService : Service() {
 
     private fun setDrawerOpen(open: Boolean) {
         _isDrawerOpen.value = open
+        if (!isHidingForCapture) {
+            syncDrawerWindowVisibility(open)
+        }
+    }
+
+    private fun syncBannerWindowVisibility() {
+        val view = bannerView ?: return
         val state = OverlayStateHolder.state.value
-        val showSaveModal = state.pendingPokemonSave != null && !state.awaitingFollowUpScan
-        syncDrawerWindowVisibility(open || showSaveModal)
+        val shouldBeVisible = state.activeRaidBoss != null && state.isRaidCardVisible
+        view.visibility = if (shouldBeVisible) View.VISIBLE else View.GONE
     }
 
     private fun syncDrawerWindowVisibility(visible: Boolean) {
@@ -687,46 +713,26 @@ class OverlayService : Service() {
         }
     }
 
-    private fun toggleScanMode() {
-        val current = OverlayStateHolder.state.value
-        if (current.scanMode == ScanMode.AUTO_WATCH) {
-            OverlayStateHolder.update {
-                it.copy(scanMode = ScanMode.BATTERY_SAVER_ONE_TAP)
-            }
-            showTransientScanMessage("Saver mode (tap 📷 to scan)")
+    private fun toggleOverlayMode() {
+        val currentMode = OverlayStateHolder.state.value.overlayMode
+        val nextMode = if (currentMode == OverlayMode.RAID) OverlayMode.SCAN else OverlayMode.RAID
+        messageClearJob?.cancel()
+        captureSessionManager.reset()
+        raidFlowCoordinator.clearActiveBoss()
+        OverlayStateHolder.setOverlayMode(nextMode)
+    }
+
+    private fun handleDismissStatusPill() {
+        messageClearJob?.cancel()
+        if (OverlayStateHolder.state.value.overlayMode == OverlayMode.SCAN) {
+            captureSessionManager.reset()
+            OverlayStateHolder.clearScanDraft()
         } else {
-            if (current.hasMediaProjection && captureEngine.hasActiveProjection) {
-                OverlayStateHolder.update {
-                    it.copy(scanMode = ScanMode.AUTO_WATCH)
-                }
-                showTransientScanMessage("Auto-watch active")
-            } else {
-                showTransientScanMessage("Grant capture in app for Auto")
-            }
+            OverlayStateHolder.clearScanMessage()
         }
     }
 
-    private fun ensureAutoWatchLoop() {
-        if (autoWatchJob?.isActive == true) return
-        autoWatchJob = serviceScope.launch {
-            while (isActive) {
-                delay(AUTO_WATCH_INTERVAL_MS)
-                val state = OverlayStateHolder.state.value
-                val shouldPoll = state.isRunning &&
-                    state.scanMode == ScanMode.AUTO_WATCH &&
-                    state.hasMediaProjection &&
-                    captureEngine.hasActiveProjection &&
-                    isScreenOn &&
-                    !_isDrawerOpen.value
-
-                if (shouldPoll) {
-                    performSingleScan(isManualTrigger = false)
-                }
-            }
-        }
-    }
-
-    private fun triggerManualScan() {
+    private fun triggerManualCapture() {
         val state = OverlayStateHolder.state.value
         if (!state.hasMediaProjection || !captureEngine.hasActiveProjection) {
             showTransientScanMessage("No capture — try ≡ Drawer")
@@ -735,130 +741,137 @@ class OverlayService : Service() {
         }
 
         serviceScope.launch {
-            val matched = performSingleScan(isManualTrigger = true, allowOwnPokemonFallback = true)
-            if (!matched) {
-                showTransientScanMessage("No boss or Pokémon found — try ≡")
-            }
+            performManualCapture()
         }
     }
 
-    private fun triggerScanMyPokemon() {
-        val state = OverlayStateHolder.state.value
-        if (!state.hasMediaProjection || !captureEngine.hasActiveProjection) {
-            showTransientScanMessage("Grant capture in app to scan")
-            return
-        }
-        setDrawerOpen(false)
-        serviceScope.launch {
-            delay(220L)
-            val found = performOwnPokemonScanOnly()
-            if (!found) {
-                showTransientScanMessage("No Pokémon details found on screen")
-            }
-        }
-    }
+    private suspend fun performManualCapture() {
+        if (!captureMutex.tryLock()) return
+        val activeMode = OverlayStateHolder.state.value.overlayMode
+        OverlayStateHolder.update { it.copy(isScanningNow = true) }
 
-    private suspend fun performOwnPokemonScanOnly(): Boolean {
-        if (!scanMutex.tryLock()) return false
-        OverlayStateHolder.update { it.copy(isScanningNow = true, lastScanMessage = null) }
-        var frameBitmap: android.graphics.Bitmap? = null
-        return try {
-            frameBitmap = captureEngine.captureLatestFrame()
-            val bitmap = frameBitmap ?: return false
-            val lines = ocrPipeline.recognizeLines(bitmap = bitmap, cropNormalized = myPokemonDetector.roiNormalized)
-            val detected = myPokemonDetector.detectFromLinesAndBitmap(
-                lines = lines,
-                bitmap = bitmap,
-                activeRaids = repository.activeRaids.value
-            )
-            if (detected != null) {
-                OverlayStateHolder.showPendingPokemonSave(detected)
-                true
-            } else {
-                false
-            }
-        } catch (_: Throwable) {
-            false
-        } finally {
+        var frameBitmap: Bitmap? = null
+        try {
+            // Hide ALL attached overlay windows before capturing so OCR sees clean game UI
+            isHidingForCapture = true
             try {
-                if (frameBitmap != null && !frameBitmap.isRecycled) frameBitmap.recycle()
-            } catch (_: Throwable) {}
-            OverlayStateHolder.update { it.copy(isScanningNow = false) }
-            scanMutex.unlock()
-        }
-    }
-
-    private suspend fun performSingleScan(
-        isManualTrigger: Boolean,
-        allowOwnPokemonFallback: Boolean = false
-    ): Boolean {
-        if (!scanMutex.tryLock()) {
-            return false
-        }
-        if (isManualTrigger) {
-            OverlayStateHolder.update {
-                it.copy(isScanningNow = true, lastScanMessage = null)
+                edgePillView?.visibility = View.INVISIBLE
+                bannerView?.visibility = View.INVISIBLE
+                drawerView?.visibility = View.INVISIBLE
+                delay(CAPTURE_HIDE_DELAY_MS)
+                frameBitmap = captureEngine.captureLatestFrame()
+            } finally {
+                isHidingForCapture = false
+                edgePillView?.visibility = View.VISIBLE
+                syncBannerWindowVisibility()
+                syncDrawerWindowVisibility(_isDrawerOpen.value)
             }
-        }
 
-        var frameBitmap: android.graphics.Bitmap? = null
-        return try {
-            frameBitmap = captureEngine.captureLatestFrame()
-            val bitmap = frameBitmap ?: return false
-            val fullLines = ocrPipeline.recognizeLines(
-                bitmap = bitmap,
-                cropNormalized = if (isManualTrigger) myPokemonDetector.roiNormalized else android.graphics.RectF(0.04f, 0.14f, 0.96f, 0.88f)
+            val bitmap = frameBitmap
+            if (bitmap == null) {
+                showTransientScanMessage("Capture failed — try again")
+                return
+            }
+
+            // Run ML Kit OCR once on the full frame
+            val lines = ocrPipeline.recognizeLines(bitmap)
+
+            var debugRaidLine: OcrLine? = null
+            var debugRaidLabel: String? = null
+            var debugAppraisal: AppraisalIvParseResult? = null
+            var debugMoveLines: List<OcrLine> = emptyList()
+
+            // Strictly route by OverlayMode (RAID vs SCAN — zero cross-mode leakage)
+            val routeResult = CapturePipelineRouter.dispatch(
+                mode = activeMode,
+                onRaid = {
+                    raidFlowCoordinator.handleCapturedLines(lines)
+                },
+                onScan = {
+                    val extraction = scanScreenParser.parse(
+                        lines = lines,
+                        bitmap = bitmap,
+                        activeSpeciesHint = captureSessionManager.currentDraft.species
+                    )
+                    val outcome = captureSessionManager.processFrame(extraction)
+                    extraction to outcome
+                }
             )
-            val screenKind = ScreenClassifier.classify(fullLines)
-            val isFollowUp = OverlayStateHolder.state.value.awaitingFollowUpScan
 
-            if (isManualTrigger && (isFollowUp || screenKind == ScreenKind.MY_POKEMON)) {
-                val own = myPokemonDetector.detectFromLinesAndBitmap(
-                    lines = fullLines,
-                    bitmap = bitmap,
-                    activeRaids = repository.activeRaids.value
-                )
-                if (own != null) {
-                    if (isFollowUp) {
-                        OverlayStateHolder.mergePendingPokemonSave(own)
-                    } else {
-                        OverlayStateHolder.showPendingPokemonSave(own)
+            when (routeResult) {
+                is CaptureRouteResult.Raid -> {
+                    when (val action = routeResult.result) {
+                        is RaidCaptureAction.ShowPreviewWeaknesses -> {
+                            debugRaidLine = action.detection.matchedLine
+                            debugRaidLabel = action.detection.match.displayTitle
+                            OverlayStateHolder.showRaidPreviewBoss(action.detection.match)
+                            scheduleTransientMessageClear("Detected ${action.detection.match.displayTitle}")
+                        }
+
+                        is RaidCaptureAction.ShowLobbySuggestedParty -> {
+                            debugRaidLabel = "LOBBY · ${action.cachedBoss.displayTitle}"
+                            OverlayStateHolder.showRaidLobbySuggestedParty(action.cachedBoss)
+                            scheduleTransientMessageClear("Suggested Party · ${action.cachedBoss.displayTitle}")
+                        }
+
+                        is RaidCaptureAction.PromptScanPreviewFirst -> {
+                            debugRaidLabel = "LOBBY (no cached boss)"
+                            showTransientScanMessage(action.message)
+                        }
+
+                        is RaidCaptureAction.BossNotDetected -> {
+                            debugRaidLabel = "No boss detected"
+                            showTransientScanMessage(action.message)
+                        }
                     }
-                    return true
                 }
-                return false
+
+                is CaptureRouteResult.Scan -> {
+                    val (extraction, outcome) = routeResult.result
+                    debugAppraisal = extraction.appraisalResult
+                    debugMoveLines = extraction.movesetResult.matchedLines
+                    OverlayStateHolder.updateScanOutcome(outcome)
+
+                    when (outcome) {
+                        is CaptureStepOutcome.Saved -> {
+                            triggerSaveHaptic()
+                            scheduleTransientMessageClear(outcome.flashMessage)
+                        }
+
+                        is CaptureStepOutcome.InProgress -> {
+                            outcome.transientFlash?.let { scheduleTransientMessageClear(it) }
+                        }
+
+                        is CaptureStepOutcome.NoData -> {
+                            scheduleTransientMessageClear(outcome.transientFlash)
+                        }
+                    }
+                }
             }
 
-            if (screenKind == ScreenKind.MY_POKEMON) {
-                return false
-            }
-
-            val topCutoff = if (isManualTrigger) 0.62f else 0.44f
-            val raidLines = fullLines.filter { it.normalizedTop in 0.06f..topCutoff }
-            val matchResult = raidBossDetector.detect(
-                lines = raidLines,
-                isManualTrigger = isManualTrigger
-            )
-            if (matchResult != null) {
-                OverlayStateHolder.showMatchedBoss(matchResult)
-                true
-            } else if (allowOwnPokemonFallback) {
-                val own = myPokemonDetector.detectFromLinesAndBitmap(
-                    lines = fullLines,
-                    bitmap = bitmap,
-                    activeRaids = repository.activeRaids.value
+            // Save annotated debug PNG BEFORE recycling the bitmap if debug toggle is enabled
+            if (OverlayStateHolder.state.value.debugSaveAnnotatedCapture) {
+                val debugData = CaptureDebugOverlayData(
+                    mode = activeMode,
+                    allOcrLines = lines,
+                    raidBossLine = debugRaidLine,
+                    raidBossLabel = debugRaidLabel,
+                    appraisalResult = debugAppraisal,
+                    matchedMoveLines = debugMoveLines
                 )
-                if (own != null) {
-                    OverlayStateHolder.showPendingPokemonSave(own)
-                    true
-                } else {
-                    false
+                val savedPath = withContext(Dispatchers.IO) {
+                    CaptureDebugAnnotator.saveAnnotatedCapture(
+                        context = applicationContext,
+                        bitmap = bitmap,
+                        data = debugData
+                    )
                 }
-            } else {
-                false
+                if (savedPath != null) {
+                    OverlayStateHolder.setLastDebugCapturePath(savedPath)
+                }
             }
         } catch (_: Throwable) {
-            false
+            showTransientScanMessage("Scan error — try again")
         } finally {
             try {
                 if (frameBitmap != null && !frameBitmap.isRecycled) {
@@ -866,24 +879,45 @@ class OverlayService : Service() {
                 }
             } catch (_: Throwable) {
             }
-            if (isManualTrigger) {
-                OverlayStateHolder.update {
-                    it.copy(isScanningNow = false)
-                }
+            OverlayStateHolder.update { it.copy(isScanningNow = false) }
+            captureMutex.unlock()
+        }
+    }
+
+    private fun triggerSaveHaptic() {
+        try {
+            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val manager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+                manager?.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            } ?: return
+
+            if (!vibrator.hasVibrator()) return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(
+                    VibrationEffect.createOneShot(50L, VibrationEffect.DEFAULT_AMPLITUDE)
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(50L)
             }
-            scanMutex.unlock()
+        } catch (_: Throwable) {
         }
     }
 
     private fun showTransientScanMessage(message: String) {
+        OverlayStateHolder.update { it.copy(lastScanMessage = message) }
+        scheduleTransientMessageClear(message)
+    }
+
+    private fun scheduleTransientMessageClear(expectedMessage: String) {
         messageClearJob?.cancel()
-        OverlayStateHolder.update {
-            it.copy(lastScanMessage = message)
-        }
         messageClearJob = serviceScope.launch {
-            delay(3000L)
+            delay(TRANSIENT_MESSAGE_MS)
             OverlayStateHolder.update { current ->
-                if (current.lastScanMessage == message) {
+                if (current.lastScanMessage == expectedMessage) {
                     current.copy(lastScanMessage = null)
                 } else {
                     current
@@ -893,15 +927,17 @@ class OverlayService : Service() {
     }
 
     private fun stopOverlayService() {
-        if (::raidBossDetector.isInitialized) {
-            raidBossDetector.resetDeduplication()
+        if (::captureSessionManager.isInitialized) {
+            captureSessionManager.reset()
+        }
+        if (::raidFlowCoordinator.isInitialized) {
+            raidFlowCoordinator.clearActiveBoss()
         }
         OverlayStateHolder.resetStopped()
         stopSelf()
     }
 
     override fun onDestroy() {
-        autoWatchJob?.cancel()
         messageClearJob?.cancel()
         serviceScope.cancel()
 
@@ -994,7 +1030,7 @@ class OverlayService : Service() {
                     "PoGo Raid Overlay Service",
                     NotificationManager.IMPORTANCE_LOW
                 ).apply {
-                    description = "Active while the Pokémon GO Raid Weakness overlay is running"
+                    description = "Active while the Pokémon GO Raid & Pokébox overlay is running"
                     setShowBadge(false)
                 }
                 manager.createNotificationChannel(channel)
@@ -1026,7 +1062,7 @@ class OverlayService : Service() {
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.app_name))
-            .setContentText("Raid weakness detector overlay is active")
+            .setContentText("Manual Raid & Scan overlay is active")
             .setContentIntent(openPendingIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -1044,9 +1080,11 @@ private fun CompactEdgePillOverlay(
     state: OverlayRuntimeState,
     isDrawerOpen: Boolean,
     onDrag: (Float, Float) -> Unit,
-    onToggleScanMode: () -> Unit,
-    onOneTapScan: () -> Unit,
-    onToggleDrawer: () -> Unit
+    onToggleOverlayMode: () -> Unit,
+    onManualCapture: () -> Unit,
+    onToggleDrawer: () -> Unit,
+    onTapStatusPill: (String) -> Unit,
+    onDismissStatus: () -> Unit
 ) {
     Column(
         horizontalAlignment = Alignment.Start
@@ -1069,28 +1107,28 @@ private fun CompactEdgePillOverlay(
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp)
             ) {
-                // [Auto ●] / [Saver] toggle pill
-                val isAutoActive = state.scanMode == ScanMode.AUTO_WATCH && state.hasMediaProjection
-                val modeBg = if (isAutoActive) Color(0xFFF7CF31) else Color(0xFFF1F3F7)
-                val modeFg = Color(0xFF1A1C20)
+                // [Raid] / [Scan] 1-tap mode toggle chip
+                val isRaidMode = state.overlayMode == OverlayMode.RAID
+                val modeBg = if (isRaidMode) Color(0xFFF7CF31) else Color(0xFF10B981)
+                val modeFg = if (isRaidMode) Color(0xFF1A1C20) else Color(0xFFFFFFFF)
 
                 Box(
                     contentAlignment = Alignment.Center,
                     modifier = Modifier
                         .clip(RoundedCornerShape(999.dp))
                         .background(modeBg)
-                        .clickable { onToggleScanMode() }
-                        .padding(horizontal = 9.dp, vertical = 5.dp)
+                        .clickable { onToggleOverlayMode() }
+                        .padding(horizontal = 10.dp, vertical = 5.dp)
                 ) {
                     Text(
-                        text = if (isAutoActive) "Auto ●" else "Saver",
+                        text = if (isRaidMode) "Raid" else "Scan",
                         color = modeFg,
                         fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.ExtraBold
                     )
                 }
 
-                // [📷] 1-tap scan button
+                // [📷] Manual 1-tap capture button
                 Box(
                     contentAlignment = Alignment.Center,
                     modifier = Modifier
@@ -1098,7 +1136,7 @@ private fun CompactEdgePillOverlay(
                         .clip(CircleShape)
                         .background(Color(0xFFF7F8FA))
                         .border(1.dp, Color(0xFFECEFF4), CircleShape)
-                        .clickable(enabled = !state.isScanningNow) { onOneTapScan() }
+                        .clickable(enabled = !state.isScanningNow) { onManualCapture() }
                 ) {
                     if (state.isScanningNow) {
                         CircularProgressIndicator(
@@ -1109,7 +1147,7 @@ private fun CompactEdgePillOverlay(
                     } else {
                         Icon(
                             imageVector = Icons.Default.CameraAlt,
-                            contentDescription = "1-Tap Scan",
+                            contentDescription = "Manual Capture",
                             tint = Color(0xFF1A1C20),
                             modifier = Modifier.size(15.dp)
                         )
@@ -1136,41 +1174,49 @@ private fun CompactEdgePillOverlay(
             }
         }
 
-        val scanMessage = state.lastScanMessage
-        LaunchedEffect(scanMessage, state.awaitingFollowUpScan) {
-            if (!scanMessage.isNullOrBlank() && !state.awaitingFollowUpScan) {
-                delay(2200L)
-                OverlayStateHolder.clearScanMessage()
+        val statusText = state.lastScanMessage?.takeIf { it.isNotBlank() }
+            ?: state.scanStatusPrompt?.takeIf {
+                state.overlayMode == OverlayMode.SCAN && it.isNotBlank()
             }
-        }
-        if (!scanMessage.isNullOrBlank()) {
+
+        if (!statusText.isNullOrBlank()) {
             Spacer(modifier = Modifier.height(4.dp))
             Surface(
                 shape = RoundedCornerShape(999.dp),
                 color = Color(0xFFFFFFFF),
                 border = BorderStroke(1.dp, Color(0xFFECEFF4)),
-                shadowElevation = 4.dp,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(999.dp))
-                    .clickable { OverlayStateHolder.clearScanMessage() }
+                shadowElevation = 4.dp
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(5.dp),
-                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp)
+                    modifier = Modifier.padding(start = 10.dp, end = 6.dp, top = 4.dp, bottom = 4.dp)
                 ) {
                     Text(
-                        text = scanMessage,
+                        text = statusText,
                         color = Color(0xFF1A1C20),
                         fontSize = 11.sp,
-                        fontWeight = FontWeight.Medium
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .clickable { onTapStatusPill(statusText) }
                     )
-                    Icon(
-                        imageVector = Icons.Default.Close,
-                        contentDescription = "Dismiss notification",
-                        tint = Color(0xFF6E7582),
-                        modifier = Modifier.size(12.dp)
-                    )
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .size(18.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFFF1F3F7))
+                            .clickable { onDismissStatus() }
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Dismiss status",
+                            tint = Color(0xFF6E7582),
+                            modifier = Modifier.size(11.dp)
+                        )
+                    }
                 }
             }
         }
@@ -1179,17 +1225,19 @@ private fun CompactEdgePillOverlay(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun PriorityWeaknessBannerOverlay(
+private fun RaidOverlayCard(
     banner: ActiveBossBanner,
+    activeTab: RaidCardTab,
     savedPokemon: List<SavedPokemon>,
     speciesById: Map<String, PokemonSpecies>,
     movesById: Map<String, MoveData>,
+    onSelectTab: (RaidCardTab) -> Unit,
     onSelectForm: (PokemonSpecies) -> Unit,
     onDismiss: () -> Unit
 ) {
     val speciesId = banner.match.species.speciesId
     var showFormSelector by remember(speciesId) { mutableStateOf(false) }
-    var showTeamExpanded by remember(speciesId) { mutableStateOf(false) }
+    var showAvoidExpanded by remember(speciesId) { mutableStateOf(false) }
 
     val primaryType = banner.matchup.defendingTypes.firstOrNull() ?: PokemonType.NORMAL
     val headerBgColor = primaryType.badgeColor()
@@ -1198,14 +1246,17 @@ private fun PriorityWeaknessBannerOverlay(
     var horizontalDragAccumulator by remember(speciesId) { mutableStateOf(0f) }
 
     val verdict = remember(speciesId, savedPokemon, speciesById, movesById) {
-        if (savedPokemon.isEmpty()) null
-        else RaidBattleSimulator.simulatePersonalTeam(
+        RaidBattleSimulator.simulatePersonalTeam(
             savedBox = savedPokemon,
             speciesById = speciesById,
             movesById = movesById,
             bossSpecies = banner.match.species,
             raidTier = 5
         )
+    }
+
+    val priorityWeaknesses = remember(banner.matchup) {
+        banner.matchup.doubleWeaknesses + banner.matchup.singleWeaknesses
     }
 
     Box(
@@ -1218,7 +1269,7 @@ private fun PriorityWeaknessBannerOverlay(
                     onHorizontalDrag = { change, dragAmount ->
                         change.consume()
                         horizontalDragAccumulator += dragAmount
-                        if (kotlin.math.abs(horizontalDragAccumulator) > 100f) {
+                        if (abs(horizontalDragAccumulator) > 100f) {
                             horizontalDragAccumulator = 0f
                             onDismiss()
                         }
@@ -1234,19 +1285,19 @@ private fun PriorityWeaknessBannerOverlay(
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(modifier = Modifier.fillMaxWidth()) {
-                // Ultra-slim single-line header
+                // Colored single-line boss header
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(5.dp),
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(headerBgColor)
-                        .padding(horizontal = 10.dp, vertical = 4.dp)
+                        .padding(horizontal = 10.dp, vertical = 5.dp)
                 ) {
                     PokemonSprite(
                         spriteFile = banner.match.species.spriteFile,
                         contentDescription = banner.match.displayTitle,
-                        size = 20.dp,
+                        size = 22.dp,
                         fallbackTint = headerContentColor
                     )
 
@@ -1271,23 +1322,6 @@ private fun PriorityWeaknessBannerOverlay(
                             Text(
                                 text = prefix,
                                 color = Color.White,
-                                fontSize = 9.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                    }
-
-                    if (verdict != null) {
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(999.dp))
-                                .background(Color.White.copy(alpha = 0.90f))
-                                .clickable { showTeamExpanded = !showTeamExpanded }
-                                .padding(horizontal = 6.dp, vertical = 2.dp)
-                        ) {
-                            Text(
-                                text = String.format(java.util.Locale.US, "Est %.1f ▾", verdict.teamEstimator),
-                                color = Color(0xFF1A1C20),
                                 fontSize = 9.sp,
                                 fontWeight = FontWeight.Bold
                             )
@@ -1322,7 +1356,7 @@ private fun PriorityWeaknessBannerOverlay(
                     ) {
                         Icon(
                             imageVector = Icons.Default.Close,
-                            contentDescription = "Dismiss Banner",
+                            contentDescription = "Dismiss Raid Card",
                             tint = headerContentColor,
                             modifier = Modifier.size(12.dp)
                         )
@@ -1368,104 +1402,222 @@ private fun PriorityWeaknessBannerOverlay(
                     }
                 }
 
-                // Bare-minimum white weakness body: ONLY 2.56× and 1.6× multipliers + compact pills
-                Column(
+                // Compact segmented tab toggle: Weaknesses | Suggested Party
+                Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(Color(0xFFFFFFFF))
-                        .padding(horizontal = 8.dp, vertical = 5.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    if (banner.matchup.doubleWeaknesses.isNotEmpty()) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(Color(0xFFFEE2E2))
-                                    .padding(horizontal = 5.dp, vertical = 2.dp)
-                            ) {
-                                Text(
-                                    text = "2.56×",
-                                    color = Color(0xFF991B1B),
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.ExtraBold
-                                )
-                            }
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                verticalArrangement = Arrangement.spacedBy(4.dp),
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                banner.matchup.doubleWeaknesses.forEach { m ->
-                                    TypeChip(type = m.attackType, compact = true)
-                                }
-                            }
-                        }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(999.dp))
+                            .background(Color(0xFFF1F3F7))
+                            .padding(2.dp),
+                        horizontalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        RaidCardSegmentButton(
+                            label = "Weaknesses",
+                            selected = activeTab == RaidCardTab.WEAKNESSES,
+                            onClick = { onSelectTab(RaidCardTab.WEAKNESSES) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        RaidCardSegmentButton(
+                            label = "Suggested Party (${verdict.team.size}/6)",
+                            selected = activeTab == RaidCardTab.SUGGESTED_PARTY,
+                            onClick = { onSelectTab(RaidCardTab.SUGGESTED_PARTY) },
+                            modifier = Modifier.weight(1f)
+                        )
                     }
+                }
 
-                    if (banner.matchup.singleWeaknesses.isNotEmpty()) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(Color(0xFFFEF3C7))
-                                    .padding(horizontal = 5.dp, vertical = 2.dp)
-                            ) {
-                                Text(
-                                    text = "1.6×",
-                                    color = Color(0xFF92400E),
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.ExtraBold
-                                )
-                            }
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                verticalArrangement = Arrangement.spacedBy(4.dp),
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                banner.matchup.singleWeaknesses.forEach { m ->
-                                    TypeChip(type = m.attackType, compact = true)
-                                }
-                            }
-                        }
-                    }
-
-                    if (showTeamExpanded && verdict != null) {
-                        Row(
+                when (activeTab) {
+                    RaidCardTab.WEAKNESSES -> {
+                        Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState())
-                                .padding(top = 2.dp),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                .background(Color(0xFFFFFFFF))
+                                .padding(start = 10.dp, end = 10.dp, bottom = 8.dp)
                         ) {
-                            verdict.team.forEach { member ->
+                            WeaknessPriorityStrip(
+                                matchup = banner.matchup,
+                                showAvoidExpanded = showAvoidExpanded,
+                                onToggleAvoid = { showAvoidExpanded = !showAvoidExpanded }
+                            )
+                        }
+                    }
+
+                    RaidCardTab.SUGGESTED_PARTY -> {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 260.dp)
+                                .verticalScroll(rememberScrollState())
+                                .background(Color(0xFFFFFFFF))
+                                .padding(start = 10.dp, end = 10.dp, bottom = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            if (verdict.team.isNotEmpty()) {
                                 Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(8.dp))
-                                        .background(Color(0xFFF7F8FA))
-                                        .padding(horizontal = 6.dp, vertical = 3.dp)
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    PokemonSprite(
-                                        spriteFile = member.species.spriteFile,
-                                        contentDescription = member.species.speciesName,
-                                        size = 20.dp
-                                    )
                                     Text(
-                                        text = "${member.pokemon.cp}",
+                                        text = verdict.verdictLabel,
                                         color = Color(0xFF1A1C20),
-                                        fontSize = 10.sp,
+                                        fontSize = 11.sp,
                                         fontWeight = FontWeight.Bold
                                     )
+                                    Text(
+                                        text = String.format(Locale.US, "Est %.1f trainers", verdict.teamEstimator),
+                                        color = Color(0xFF6E7582),
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
+
+                            // 6-slot Suggested Party list
+                            for (slotIndex in 0 until 6) {
+                                val member = verdict.team.getOrNull(slotIndex)
+                                if (member != null) {
+                                    val movesText = listOfNotNull(
+                                        member.fastMove?.displayName,
+                                        member.chargedMove?.displayName
+                                    ).joinToString(" + ").ifEmpty { "Moveset unset" }
+
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(9.dp))
+                                            .background(Color(0xFFF7F8FA))
+                                            .border(1.dp, Color(0xFFECEFF4), RoundedCornerShape(9.dp))
+                                            .padding(horizontal = 7.dp, vertical = 4.dp)
+                                    ) {
+                                        Text(
+                                            text = "#${slotIndex + 1}",
+                                            color = Color(0xFF6E7582),
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.ExtraBold,
+                                            modifier = Modifier.width(18.dp)
+                                        )
+                                        PokemonSprite(
+                                            spriteFile = member.species.spriteFile,
+                                            contentDescription = member.species.speciesName,
+                                            size = 24.dp
+                                        )
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                            ) {
+                                                Text(
+                                                    text = member.species.speciesName,
+                                                    color = Color(0xFF1A1C20),
+                                                    fontSize = 11.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                if (member.pokemon.isShadow) {
+                                                    Text(
+                                                        text = "Shadow",
+                                                        color = Color(0xFF5E35B1),
+                                                        fontSize = 9.sp,
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                }
+                                            }
+                                            Text(
+                                                text = movesText,
+                                                color = Color(0xFF6E7582),
+                                                fontSize = 10.sp,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                        Text(
+                                            text = "CP ${member.pokemon.cp}",
+                                            color = Color(0xFF1A1C20),
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.ExtraBold
+                                        )
+                                    }
+                                } else {
+                                    val suggestedMatchup = if (priorityWeaknesses.isNotEmpty()) {
+                                        val offset = slotIndex - verdict.team.size
+                                        priorityWeaknesses[offset % priorityWeaknesses.size]
+                                    } else {
+                                        null
+                                    }
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(9.dp))
+                                            .background(Color(0xFFFAFAFC))
+                                            .border(1.dp, Color(0xFFE5E7EB), RoundedCornerShape(9.dp))
+                                            .padding(horizontal = 7.dp, vertical = 4.dp)
+                                    ) {
+                                        Text(
+                                            text = "#${slotIndex + 1}",
+                                            color = Color(0xFF9CA3AF),
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.width(18.dp)
+                                        )
+                                        Text(
+                                            text = if (suggestedMatchup != null) {
+                                                val mult = if (suggestedMatchup.multiplier >= 2.0) "2.56×" else "1.6×"
+                                                "Empty slot · Bring $mult"
+                                            } else {
+                                                "Empty slot · Add counter in Scan mode"
+                                            },
+                                            color = Color(0xFF6E7582),
+                                            fontSize = 10.sp,
+                                            modifier = Modifier.weight(1f),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        if (suggestedMatchup != null) {
+                                            TypeChip(type = suggestedMatchup.attackType, compact = true)
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (verdict.team.size < 6 && priorityWeaknesses.isNotEmpty()) {
+                                val remaining = 6 - verdict.team.size
+                                Column(
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(top = 2.dp)
+                                ) {
+                                    Text(
+                                        text = if (verdict.team.isEmpty()) {
+                                            "No saved counters yet — switch pill to Scan mode or fill 6 slots with:"
+                                        } else {
+                                            "Fill remaining $remaining slot${if (remaining == 1) "" else "s"} with top weakness types:"
+                                        },
+                                        color = Color(0xFF6E7582),
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    FlowRow(
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        priorityWeaknesses.take(5).forEach { w ->
+                                            TypeChip(type = w.attackType, compact = true)
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1476,14 +1628,38 @@ private fun PriorityWeaknessBannerOverlay(
     }
 }
 
+@Composable
+private fun RaidCardSegmentButton(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(if (selected) Color(0xFF1A1C20) else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 4.dp)
+    ) {
+        Text(
+            text = label,
+            color = if (selected) Color.White else Color(0xFF6E7582),
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun QuickDrawerOverlay(
     activeRaids: List<RaidBossEntry>,
     allSpecies: List<PokemonSpecies>,
     isRefreshingRaids: Boolean,
-    hasMediaProjection: Boolean,
-    onScanOwnPokemon: () -> Unit,
     onRefreshRaids: () -> Unit,
     onSelectRaidBoss: (RaidBossEntry) -> Unit,
     onSelectSpecies: (PokemonSpecies) -> Unit,
@@ -1534,7 +1710,7 @@ private fun QuickDrawerOverlay(
                             fontWeight = FontWeight.ExtraBold
                         )
                         Text(
-                            text = "Tap any boss to pin its weakness banner",
+                            text = "Pick a raid boss to show weaknesses & party",
                             color = Color(0xFF6E7582),
                             fontSize = 11.sp
                         )
@@ -1858,320 +2034,22 @@ private fun QuickDrawerOverlay(
                 HorizontalDivider(color = Color(0xFFECEFF4))
                 Spacer(modifier = Modifier.height(10.dp))
 
-                // Bottom actions: Scan My Pokémon + Stop Overlay
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                OutlinedButton(
+                    onClick = onStopOverlay,
+                    shape = RoundedCornerShape(999.dp),
+                    border = BorderStroke(1.dp, Color(0xFFE53935)),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = Color(0xFFD32F2F)
+                    ),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    if (hasMediaProjection) {
-                        Button(
-                            onClick = onScanOwnPokemon,
-                            shape = RoundedCornerShape(999.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = Color(0xFF1A1C20),
-                                contentColor = Color.White
-                            ),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text(
-                                text = "Scan My Pokémon",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                    }
-                    OutlinedButton(
-                        onClick = onStopOverlay,
-                        shape = RoundedCornerShape(999.dp),
-                        border = BorderStroke(1.dp, Color(0xFFE53935)),
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            contentColor = Color(0xFFD32F2F)
-                        ),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text(
-                            text = "Stop Overlay",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun PendingPokemonSaveOverlay(
-    detected: DetectedOwnPokemon,
-    movesById: Map<String, MoveData>,
-    onSave: (SavedPokemon) -> Unit,
-    onBeginFollowUpScan: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    var selectedSpecies by remember(detected) { mutableStateOf(detected.species) }
-    var cpText by remember(detected) { mutableStateOf(detected.cp?.toString() ?: "") }
-    var ivAtk by remember(detected) { mutableIntStateOf(detected.ivAtk ?: 12) }
-    var ivDef by remember(detected) { mutableIntStateOf(detected.ivDef ?: 12) }
-    var ivSta by remember(detected) { mutableIntStateOf(detected.ivSta ?: 12) }
-
-    val cpInt = cpText.toIntOrNull()
-    val solvedLevel = remember(selectedSpecies, cpInt, detected.hp, detected.powerUpDust, ivAtk, ivDef, ivSta) {
-        if (cpInt != null && cpInt > 0) {
-            PokemonMathEngine.solveLevel(
-                baseAtk = selectedSpecies.baseAtk,
-                baseDef = selectedSpecies.baseDef,
-                baseSta = selectedSpecies.baseSta,
-                ivAtk = ivAtk,
-                ivDef = ivDef,
-                ivSta = ivSta,
-                cp = cpInt,
-                hp = detected.hp,
-                powerUpDust = detected.powerUpDust,
-                isShadow = detected.isShadow,
-                isPurified = detected.isPurified,
-                isLucky = detected.isLucky
-            )
-        } else 20.0
-    }
-
-    val moveEval = remember(selectedSpecies, detected.fastMove, detected.chargedMove1, detected.chargedMove2, movesById) {
-        RaidBattleSimulator.evaluateMoveset(
-            species = selectedSpecies,
-            movesById = movesById,
-            currentFastId = detected.fastMove?.moveId,
-            currentCharged1Id = detected.chargedMove1?.moveId,
-            currentCharged2Id = detected.chargedMove2?.moveId
-        )
-    }
-
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 20.dp)
-    ) {
-        Surface(
-            shape = RoundedCornerShape(20.dp),
-            color = Color.White,
-            border = BorderStroke(1.dp, Color(0xFFECEFF4)),
-            shadowElevation = 14.dp,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        PokemonSprite(
-                            spriteFile = selectedSpecies.spriteFile,
-                            contentDescription = selectedSpecies.speciesName,
-                            size = 40.dp
-                        )
-                        Column {
-                            Text(
-                                text = selectedSpecies.speciesName,
-                                color = Color(0xFF1A1C20),
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.ExtraBold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            val subParts = buildList {
-                                detected.nickname?.let { add("\"$it\"") }
-                                add(if (cpInt != null) "CP $cpInt" else "CP needed")
-                                add("Lv ${formatLevel(solvedLevel)}")
-                                if (detected.isShadow) add("Shadow")
-                            }
-                            Text(
-                                text = subParts.joinToString(" • "),
-                                color = if (cpInt == null) Color(0xFFD97706) else Color(0xFF6E7582),
-                                fontSize = 11.sp
-                            )
-                        }
-                    }
-                    IconButton(onClick = onDismiss, modifier = Modifier.size(28.dp)) {
-                        Icon(Icons.Default.Close, contentDescription = "Close", tint = Color(0xFF1A1C20))
-                    }
-                }
-
-                // Form selector when multiple forms exist (e.g. Kyurem / Black / White, Zacian Crowned)
-                if (detected.alternateForms.size > 1) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        detected.alternateForms.forEach { form ->
-                            val isSel = form.speciesId == selectedSpecies.speciesId
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(999.dp))
-                                    .background(if (isSel) Color(0xFF1A1C20) else Color(0xFFF7F8FA))
-                                    .border(1.dp, Color(0xFFECEFF4), RoundedCornerShape(999.dp))
-                                    .clickable { selectedSpecies = form }
-                                    .padding(horizontal = 8.dp, vertical = 3.dp)
-                            ) {
-                                Text(
-                                    text = form.formLabel() ?: "Standard",
-                                    color = if (isSel) Color.White else Color(0xFF1A1C20),
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // Editable CP box (prompts clearly if CP was covered by the Pokémon model)
-                OutlinedTextField(
-                    value = cpText,
-                    onValueChange = { cpText = it.filter(Char::isDigit).take(4) },
-                    label = {
-                        Text(
-                            if (detected.cp == null) "Enter CP (not visible on screen)" else "CP (edit if misread)",
-                            fontSize = 11.sp
-                        )
-                    },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    singleLine = true,
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                val moveLine = listOfNotNull(
-                    detected.fastMove?.displayName,
-                    detected.chargedMove1?.displayName,
-                    detected.chargedMove2?.displayName
-                ).joinToString(" / ")
-                if (moveLine.isNotEmpty()) {
                     Text(
-                        text = "Moves: $moveLine",
-                        color = Color(0xFF1A1C20),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Medium
-                    )
-                }
-
-                moveEval?.let { eval ->
-                    Text(
-                        text = eval.recommendationText,
-                        color = if (eval.isCurrentOptimal || eval.currentNeutralDps == null) {
-                            Color(0xFF16A34A)
-                        } else {
-                            Color(0xFFD97706)
-                        },
-                        fontSize = 11.sp,
+                        text = "Stop Overlay",
+                        fontSize = 12.sp,
                         fontWeight = FontWeight.Bold
                     )
                 }
-
-                Text(
-                    text = if (detected.ivAtk != null) {
-                        "Appraisal IVs: $ivAtk / $ivDef / $ivSta"
-                    } else {
-                        "IVs not scanned (open Appraisal & tap Scan, or set): $ivAtk/$ivDef/$ivSta"
-                    },
-                    color = if (detected.ivAtk != null) Color(0xFF16A34A) else Color(0xFF1A1C20),
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                OverlayIvRow("Atk", ivAtk) { ivAtk = it }
-                OverlayIvRow("Def", ivDef) { ivDef = it }
-                OverlayIvRow("Sta", ivSta) { ivSta = it }
-
-                if (detected.fastMove == null || detected.ivAtk == null || detected.cp == null) {
-                    val promptLabel = when {
-                        detected.fastMove == null -> "Scroll down to Moves & tap 📷"
-                        else -> "Scroll up to Appraisal/CP & tap 📷"
-                    }
-                    OutlinedButton(
-                        onClick = onBeginFollowUpScan,
-                        shape = RoundedCornerShape(999.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(promptLabel, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-                    }
-                }
-
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    OutlinedButton(
-                        onClick = onDismiss,
-                        shape = RoundedCornerShape(999.dp),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("Cancel", fontSize = 12.sp)
-                    }
-                    Button(
-                        onClick = {
-                            val validCp = cpInt ?: return@Button
-                            onSave(
-                                SavedPokemon(
-                                    id = UUID.randomUUID().toString(),
-                                    speciesId = selectedSpecies.speciesId,
-                                    pokebattlerId = selectedSpecies.pokebattlerId
-                                        ?: selectedSpecies.speciesId.uppercase(),
-                                    nickname = detected.nickname,
-                                    cp = validCp,
-                                    hp = detected.hp,
-                                    ivAtk = ivAtk,
-                                    ivDef = ivDef,
-                                    ivSta = ivSta,
-                                    level = solvedLevel,
-                                    isShadow = detected.isShadow,
-                                    isPurified = detected.isPurified,
-                                    isLucky = detected.isLucky,
-                                    isMegaCapable = selectedSpecies.tags.contains("mega"),
-                                    fastMoveId = detected.fastMove?.moveId,
-                                    chargedMove1Id = detected.chargedMove1?.moveId,
-                                    chargedMove2Id = detected.chargedMove2?.moveId,
-                                    savedAtMs = System.currentTimeMillis()
-                                )
-                            )
-                        },
-                        enabled = cpInt != null && cpInt > 0,
-                        shape = RoundedCornerShape(999.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF1A1C20),
-                            contentColor = Color.White
-                        ),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("Save to Box", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                    }
-                }
             }
         }
-    }
-}
-
-@Composable
-private fun OverlayIvRow(label: String, value: Int, onChange: (Int) -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-        Text("$label $value", color = Color(0xFF1A1C20), fontSize = 11.sp, modifier = Modifier.width(46.dp))
-        Slider(
-            value = value.toFloat(),
-            onValueChange = { onChange(it.roundToInt().coerceIn(0, 15)) },
-            valueRange = 0f..15f,
-            steps = 14,
-            modifier = Modifier.weight(1f)
-        )
     }
 }

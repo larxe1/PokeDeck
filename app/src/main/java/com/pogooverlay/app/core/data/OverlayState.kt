@@ -1,14 +1,20 @@
 package com.pogooverlay.app.core.data
 
-import com.pogooverlay.app.core.detector.DetectedOwnPokemon
+import com.pogooverlay.app.core.scan.ActiveCaptureDraft
+import com.pogooverlay.app.core.scan.CaptureStepOutcome
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 
-enum class ScanMode {
-    AUTO_WATCH,
-    BATTERY_SAVER_ONE_TAP
+enum class OverlayMode {
+    RAID,
+    SCAN
+}
+
+enum class RaidCardTab {
+    WEAKNESSES,
+    SUGGESTED_PARTY
 }
 
 data class ActiveBossBanner(
@@ -19,13 +25,17 @@ data class ActiveBossBanner(
 
 data class OverlayRuntimeState(
     val isRunning: Boolean = false,
-    val scanMode: ScanMode = ScanMode.AUTO_WATCH,
+    val overlayMode: OverlayMode = OverlayMode.RAID,
     val hasMediaProjection: Boolean = false,
     val isScanningNow: Boolean = false,
-    val activeBanner: ActiveBossBanner? = null,
-    val pendingPokemonSave: DetectedOwnPokemon? = null,
-    val awaitingFollowUpScan: Boolean = false,
-    val lastScanMessage: String? = null
+    val activeRaidBoss: ActiveBossBanner? = null,
+    val isRaidCardVisible: Boolean = false,
+    val activeRaidTab: RaidCardTab = RaidCardTab.WEAKNESSES,
+    val scanDraft: ActiveCaptureDraft = ActiveCaptureDraft(),
+    val scanStatusPrompt: String? = null,
+    val lastScanMessage: String? = null,
+    val debugSaveAnnotatedCapture: Boolean = false,
+    val lastDebugCapturePath: String? = null
 )
 
 object OverlayStateHolder {
@@ -36,7 +46,22 @@ object OverlayStateHolder {
         _state.update(transform)
     }
 
-    fun showMatchedBoss(match: SpeciesMatchResult) {
+    fun setOverlayMode(mode: OverlayMode) {
+        _state.update { current ->
+            val switchingMode = current.overlayMode != mode
+            current.copy(
+                overlayMode = mode,
+                activeRaidBoss = if (switchingMode) null else current.activeRaidBoss,
+                isRaidCardVisible = false,
+                activeRaidTab = RaidCardTab.WEAKNESSES,
+                scanDraft = ActiveCaptureDraft(),
+                scanStatusPrompt = null,
+                lastScanMessage = null
+            )
+        }
+    }
+
+    fun showRaidPreviewBoss(match: SpeciesMatchResult) {
         val matchup = TypeEffectivenessChart.calculate(match.species.parsedTypes())
         val banner = ActiveBossBanner(
             match = match,
@@ -45,17 +70,43 @@ object OverlayStateHolder {
         )
         _state.update { current ->
             current.copy(
-                activeBanner = banner,
+                activeRaidBoss = banner,
+                isRaidCardVisible = true,
+                activeRaidTab = RaidCardTab.WEAKNESSES,
                 lastScanMessage = "Detected ${match.displayTitle}"
             )
         }
+    }
+
+    fun showRaidLobbySuggestedParty(match: SpeciesMatchResult) {
+        val matchup = TypeEffectivenessChart.calculate(match.species.parsedTypes())
+        val banner = ActiveBossBanner(
+            match = match,
+            matchup = matchup,
+            detectedAtMs = System.currentTimeMillis()
+        )
+        _state.update { current ->
+            val resolvedBanner = current.activeRaidBoss
+                ?.takeIf { it.match.species.speciesId == match.species.speciesId }
+                ?: banner
+            current.copy(
+                activeRaidBoss = resolvedBanner,
+                isRaidCardVisible = true,
+                activeRaidTab = RaidCardTab.SUGGESTED_PARTY,
+                lastScanMessage = "Suggested Party · ${resolvedBanner.match.displayTitle}"
+            )
+        }
+    }
+
+    fun setRaidCardTab(tab: RaidCardTab) {
+        _state.update { it.copy(activeRaidTab = tab) }
     }
 
     fun selectForm(
         species: PokemonSpecies,
         allForms: List<PokemonSpecies>,
         detectedPrefix: String?
-    ) {
+    ): SpeciesMatchResult {
         val displayTitle = PokemonNameMatcher.formatDisplayTitle(species, detectedPrefix)
         val match = SpeciesMatchResult(
             species = species,
@@ -72,62 +123,89 @@ object OverlayStateHolder {
         )
         _state.update { current ->
             current.copy(
-                activeBanner = banner,
+                activeRaidBoss = banner,
+                isRaidCardVisible = true,
                 lastScanMessage = "Selected $displayTitle"
             )
         }
+        return match
     }
 
     fun showManualSpecies(
         species: PokemonSpecies,
         allForms: List<PokemonSpecies>
-    ) {
-        selectForm(species = species, allForms = allForms, detectedPrefix = null)
+    ): SpeciesMatchResult {
+        val match = selectForm(species = species, allForms = allForms, detectedPrefix = null)
+        _state.update { it.copy(activeRaidTab = RaidCardTab.WEAKNESSES) }
+        return match
     }
 
-    fun dismissBanner() {
-        _state.update { it.copy(activeBanner = null) }
+    fun dismissRaidCard() {
+        _state.update { it.copy(isRaidCardVisible = false) }
     }
 
-    fun showPendingPokemonSave(detected: DetectedOwnPokemon) {
+    fun clearCachedRaidBoss() {
         _state.update {
             it.copy(
-                pendingPokemonSave = detected,
-                awaitingFollowUpScan = false,
-                lastScanMessage = "Scanned ${detected.species.speciesName}${detected.cp?.let { c -> " (CP $c)" } ?: ""}"
+                activeRaidBoss = null,
+                isRaidCardVisible = false,
+                activeRaidTab = RaidCardTab.WEAKNESSES
             )
         }
     }
 
-    fun beginFollowUpPokemonScan() {
-        _state.update {
-            it.copy(
-                awaitingFollowUpScan = true,
-                lastScanMessage = "Scroll & tap 📷 to scan more info"
-            )
-        }
-    }
-
-    fun mergePendingPokemonSave(incoming: DetectedOwnPokemon) {
+    fun updateScanOutcome(outcome: CaptureStepOutcome) {
         _state.update { current ->
-            val merged = current.pendingPokemonSave?.mergeWith(incoming) ?: incoming
-            current.copy(
-                pendingPokemonSave = merged,
-                awaitingFollowUpScan = false,
-                lastScanMessage = "Updated ${merged.species.speciesName}"
-            )
+            when (outcome) {
+                is CaptureStepOutcome.Saved -> current.copy(
+                    scanDraft = ActiveCaptureDraft(),
+                    scanStatusPrompt = null,
+                    lastScanMessage = outcome.flashMessage
+                )
+
+                is CaptureStepOutcome.InProgress -> current.copy(
+                    scanDraft = outcome.draft,
+                    scanStatusPrompt = outcome.persistentStatus,
+                    lastScanMessage = outcome.transientFlash
+                )
+
+                is CaptureStepOutcome.NoData -> current.copy(
+                    scanDraft = outcome.draft,
+                    scanStatusPrompt = outcome.persistentStatus,
+                    lastScanMessage = outcome.transientFlash
+                )
+            }
         }
     }
 
-    fun dismissPendingPokemonSave() {
-        _state.update { it.copy(pendingPokemonSave = null, awaitingFollowUpScan = false) }
+    fun clearScanDraft() {
+        _state.update {
+            it.copy(
+                scanDraft = ActiveCaptureDraft(),
+                scanStatusPrompt = null,
+                lastScanMessage = null
+            )
+        }
     }
 
     fun clearScanMessage() {
-        _state.update { it.copy(lastScanMessage = null, awaitingFollowUpScan = false) }
+        _state.update { it.copy(lastScanMessage = null) }
+    }
+
+    fun setDebugSaveAnnotatedCapture(enabled: Boolean) {
+        _state.update { it.copy(debugSaveAnnotatedCapture = enabled) }
+    }
+
+    fun setLastDebugCapturePath(path: String?) {
+        _state.update { it.copy(lastDebugCapturePath = path) }
     }
 
     fun resetStopped() {
-        _state.value = OverlayRuntimeState()
+        _state.update { current ->
+            OverlayRuntimeState(
+                debugSaveAnnotatedCapture = current.debugSaveAnnotatedCapture,
+                lastDebugCapturePath = current.lastDebugCapturePath
+            )
+        }
     }
 }

@@ -48,6 +48,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -62,16 +63,17 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.pogooverlay.app.core.data.OverlayMode
 import com.pogooverlay.app.core.data.OverlayRuntimeState
 import com.pogooverlay.app.core.data.PokemonNameMatcher
 import com.pogooverlay.app.core.data.PokemonSpecies
 import com.pogooverlay.app.core.data.PokemonType
 import com.pogooverlay.app.core.data.RaidBossEntry
-import com.pogooverlay.app.core.data.ScanMode
 import com.pogooverlay.app.core.data.SpeciesMatchResult
 import com.pogooverlay.app.core.data.TypeEffectivenessChart
 import com.pogooverlay.app.core.pokebox.MoveData
@@ -134,6 +136,7 @@ fun HomeScreen(
     onDeletePokemon: (String) -> Unit,
     onRequestOverlayPermission: () -> Unit,
     onRequestNotificationPermission: () -> Unit,
+    onToggleDebugAnnotatedCapture: (Boolean) -> Unit,
     onActivateOverlay: () -> Unit,
     onStartManualOnly: () -> Unit,
     onStopOverlay: () -> Unit,
@@ -285,9 +288,12 @@ fun HomeScreen(
                             lastRaidsRefreshEpochMs = lastRaidsRefreshEpochMs,
                             isRefreshing = isRefreshing,
                             lastError = lastError,
+                            debugSaveAnnotatedCapture = overlayState.debugSaveAnnotatedCapture,
+                            lastDebugCapturePath = overlayState.lastDebugCapturePath,
                             onRequestOverlayPermission = onRequestOverlayPermission,
                             onRequestNotificationPermission = onRequestNotificationPermission,
                             onRefreshRaids = onRefreshRaids,
+                            onToggleDebugAnnotatedCapture = onToggleDebugAnnotatedCapture,
                         )
                     }
                 }
@@ -387,7 +393,8 @@ private fun HeroHeader(
                     )
                     StatusPill(
                         isRunning = overlayState.isRunning,
-                        scanMode = overlayState.scanMode,
+                        overlayMode = overlayState.overlayMode,
+                        hasMediaProjection = overlayState.hasMediaProjection,
                         heroContentColor = heroContentColor,
                     )
                 }
@@ -623,13 +630,15 @@ private fun HeroHeader(
 @Composable
 private fun StatusPill(
     isRunning: Boolean,
-    scanMode: ScanMode,
+    overlayMode: OverlayMode,
+    hasMediaProjection: Boolean,
     heroContentColor: Color,
 ) {
     val label = when {
         !isRunning -> "Idle"
-        scanMode == ScanMode.AUTO_WATCH -> "Auto Watch"
-        else -> "Battery Saver"
+        !hasMediaProjection -> "Manual"
+        overlayMode == OverlayMode.RAID -> "Raid Mode"
+        else -> "Scan Mode"
     }
     val dotColor = if (isRunning) PokedexSuccess else heroContentColor.copy(alpha = 0.55f)
 
@@ -1182,9 +1191,12 @@ private fun SetupStatusContent(
     lastRaidsRefreshEpochMs: Long?,
     isRefreshing: Boolean,
     lastError: String?,
+    debugSaveAnnotatedCapture: Boolean,
+    lastDebugCapturePath: String?,
     onRequestOverlayPermission: () -> Unit,
     onRequestNotificationPermission: () -> Unit,
     onRefreshRaids: () -> Unit,
+    onToggleDebugAnnotatedCapture: (Boolean) -> Unit,
 ) {
     val linkedSpritesCount = remember(species) {
         species.count { !it.spriteFile.isNullOrBlank() }
@@ -1254,6 +1266,112 @@ private fun SetupStatusContent(
             actionEnabled = !isRefreshing,
             onAction = onRefreshRaids,
         )
+
+        DebugCaptureToggleCard(
+            enabled = debugSaveAnnotatedCapture,
+            lastCapturePath = lastDebugCapturePath,
+            onToggle = onToggleDebugAnnotatedCapture,
+        )
+    }
+}
+
+@Composable
+private fun DebugCaptureToggleCard(
+    enabled: Boolean,
+    lastCapturePath: String?,
+    onToggle: (Boolean) -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = PokedexSurface,
+        border = BorderStroke(1.dp, PokedexBorder),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = "Debug Annotated Capture",
+                            color = PokedexInk,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Surface(
+                            shape = RoundedCornerShape(50),
+                            color = if (enabled) {
+                                PokedexSuccess.copy(alpha = 0.12f)
+                            } else {
+                                PokedexSubtle
+                            },
+                        ) {
+                            Text(
+                                text = if (enabled) "On" else "Off",
+                                color = if (enabled) PokedexSuccess else PokedexMuted,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                            )
+                        }
+                    }
+                    Text(
+                        text = "Saves last_capture.png with OCR boxes, Raid boss detection, Appraisal IV bar scanlines, and matched moves after each manual capture.",
+                        color = PokedexMuted,
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp,
+                    )
+                }
+
+                Switch(
+                    checked = enabled,
+                    onCheckedChange = onToggle,
+                )
+            }
+
+            if (!lastCapturePath.isNullOrBlank()) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(10.dp),
+                    color = PokedexSubtle,
+                    border = BorderStroke(1.dp, PokedexBorder),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Text(
+                            text = "Last saved capture",
+                            color = PokedexMuted,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = lastCapturePath,
+                            color = PokedexInk,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 

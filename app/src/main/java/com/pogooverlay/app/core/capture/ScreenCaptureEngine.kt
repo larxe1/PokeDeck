@@ -19,6 +19,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.nio.ByteBuffer
 import kotlin.math.roundToInt
 
 class ScreenCaptureEngine(
@@ -33,6 +34,7 @@ class ScreenCaptureEngine(
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val captureMutex = Mutex()
+    private val lifecycleLock = Any()
 
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
@@ -60,51 +62,54 @@ class ScreenCaptureEngine(
 
     fun start(projection: MediaProjection): Boolean {
         release()
-        return try {
-            val (width, height, densityDpi) = computeScaledMetrics()
-            captureWidth = width
-            captureHeight = height
-            captureDensityDpi = densityDpi
+        return synchronized(lifecycleLock) {
+            try {
+                val (width, height, densityDpi) = computeScaledMetrics()
+                captureWidth = width
+                captureHeight = height
+                captureDensityDpi = densityDpi
 
-            // Android 14/15 requirement: register MediaProjection.Callback BEFORE createVirtualDisplay
-            projection.registerCallback(projectionCallback, mainHandler)
+                // Android 14/15 requirement: register MediaProjection.Callback BEFORE createVirtualDisplay
+                projection.registerCallback(projectionCallback, mainHandler)
 
-            val reader = ImageReader.newInstance(
-                captureWidth,
-                captureHeight,
-                PixelFormat.RGBA_8888,
-                MAX_IMAGES
-            )
+                // Persistent ImageReader with no background listener — remains idle until manual captureLatestFrame()
+                val reader = ImageReader.newInstance(
+                    captureWidth,
+                    captureHeight,
+                    PixelFormat.RGBA_8888,
+                    MAX_IMAGES
+                )
 
-            val display = projection.createVirtualDisplay(
-                VIRTUAL_DISPLAY_NAME,
-                captureWidth,
-                captureHeight,
-                captureDensityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                reader.surface,
-                null,
-                mainHandler
-            )
+                val display = projection.createVirtualDisplay(
+                    VIRTUAL_DISPLAY_NAME,
+                    captureWidth,
+                    captureHeight,
+                    captureDensityDpi,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    reader.surface,
+                    null,
+                    mainHandler
+                )
 
-            if (display == null) {
-                reader.close()
-                try {
-                    projection.unregisterCallback(projectionCallback)
-                } catch (_: Throwable) {
+                if (display == null) {
+                    reader.close()
+                    try {
+                        projection.unregisterCallback(projectionCallback)
+                    } catch (_: Throwable) {
+                    }
+                    return@synchronized false
                 }
-                return false
-            }
 
-            mediaProjection = projection
-            imageReader = reader
-            virtualDisplay = display
-            isCapturing = true
-            isScreenOn = isDeviceInteractive()
-            true
-        } catch (_: Throwable) {
-            release()
-            false
+                mediaProjection = projection
+                imageReader = reader
+                virtualDisplay = display
+                isCapturing = true
+                isScreenOn = isDeviceInteractive()
+                true
+            } catch (_: Throwable) {
+                releaseInternal(stopProjection = true)
+                false
+            }
         }
     }
 
@@ -123,39 +128,7 @@ class ScreenCaptureEngine(
                     image = reader.acquireLatestImage()
                 }
                 val acquired = image ?: return@withLock null
-                val width = acquired.width
-                val height = acquired.height
-                val planes = acquired.planes
-                if (width <= 0 || height <= 0 || planes.isEmpty()) {
-                    return@withLock null
-                }
-
-                val plane = planes[0]
-                val buffer = plane.buffer ?: return@withLock null
-                val pixelStride = plane.pixelStride
-                val rowStride = plane.rowStride
-                if (pixelStride <= 0 || rowStride <= 0) {
-                    return@withLock null
-                }
-
-                val rowPadding = (rowStride - pixelStride * width).coerceAtLeast(0)
-                val paddedWidth = width + (rowPadding / pixelStride)
-
-                val paddedBitmap = Bitmap.createBitmap(
-                    paddedWidth,
-                    height,
-                    Bitmap.Config.ARGB_8888
-                )
-                buffer.rewind()
-                paddedBitmap.copyPixelsFromBuffer(buffer)
-
-                if (paddedWidth == width) {
-                    paddedBitmap
-                } else {
-                    val croppedBitmap = Bitmap.createBitmap(paddedBitmap, 0, 0, width, height)
-                    paddedBitmap.recycle()
-                    croppedBitmap
-                }
+                imageToBitmap(acquired)
             } catch (_: Throwable) {
                 null
             } finally {
@@ -167,38 +140,111 @@ class ScreenCaptureEngine(
         }
     }
 
+    private fun imageToBitmap(image: Image): Bitmap? {
+        val width = image.width
+        val height = image.height
+        val planes = image.planes
+        if (width <= 0 || height <= 0 || planes.isEmpty()) {
+            return null
+        }
+
+        val plane = planes[0]
+        val buffer = plane.buffer ?: return null
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
+        if (pixelStride <= 0 || rowStride <= 0) {
+            return null
+        }
+
+        val rowPadding = (rowStride - pixelStride * width).coerceAtLeast(0)
+        buffer.rewind()
+
+        if (pixelStride == 4 && rowPadding == 0) {
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            bitmap.copyPixelsFromBuffer(buffer)
+            return bitmap
+        }
+
+        if (pixelStride == 4 && rowPadding % pixelStride == 0) {
+            val paddedWidth = width + (rowPadding / pixelStride)
+            val expectedBytes = paddedWidth.toLong() * height.toLong() * 4L
+            if (buffer.remaining().toLong() >= expectedBytes) {
+                val paddedBitmap = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888)
+                paddedBitmap.copyPixelsFromBuffer(buffer)
+                val croppedBitmap = Bitmap.createBitmap(paddedBitmap, 0, 0, width, height)
+                paddedBitmap.recycle()
+                return croppedBitmap
+            }
+        }
+
+        // Row-by-row copy handles arbitrary rowStride/pixelStride and buffers without trailing padding on the last row
+        val packed = ByteArray(width * height * 4)
+        val rowBuffer = ByteArray(rowStride.coerceAtLeast(width * pixelStride))
+        var dstOffset = 0
+        for (row in 0 until height) {
+            val rowStart = row * rowStride
+            if (rowStart >= buffer.limit()) break
+            val bytesToRead = minOf(rowStride, buffer.limit() - rowStart)
+            buffer.position(rowStart)
+            buffer.get(rowBuffer, 0, bytesToRead)
+
+            if (pixelStride == 4) {
+                val copyLen = minOf(width * 4, bytesToRead)
+                System.arraycopy(rowBuffer, 0, packed, dstOffset, copyLen)
+                dstOffset += width * 4
+            } else {
+                for (col in 0 until width) {
+                    val srcIdx = col * pixelStride
+                    if (srcIdx + 3 < bytesToRead) {
+                        packed[dstOffset] = rowBuffer[srcIdx]
+                        packed[dstOffset + 1] = rowBuffer[srcIdx + 1]
+                        packed[dstOffset + 2] = rowBuffer[srcIdx + 2]
+                        packed[dstOffset + 3] = rowBuffer[srcIdx + 3]
+                    }
+                    dstOffset += 4
+                }
+            }
+        }
+
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(packed))
+        return bitmap
+    }
+
     fun release() {
         releaseInternal(stopProjection = true)
     }
 
     private fun releaseInternal(stopProjection: Boolean) {
-        isCapturing = false
+        synchronized(lifecycleLock) {
+            isCapturing = false
 
-        try {
-            virtualDisplay?.release()
-        } catch (_: Throwable) {
-        } finally {
-            virtualDisplay = null
-        }
-
-        try {
-            imageReader?.close()
-        } catch (_: Throwable) {
-        } finally {
-            imageReader = null
-        }
-
-        val projection = mediaProjection
-        mediaProjection = null
-        if (projection != null) {
             try {
-                projection.unregisterCallback(projectionCallback)
+                virtualDisplay?.release()
             } catch (_: Throwable) {
+            } finally {
+                virtualDisplay = null
             }
-            if (stopProjection) {
+
+            try {
+                imageReader?.close()
+            } catch (_: Throwable) {
+            } finally {
+                imageReader = null
+            }
+
+            val projection = mediaProjection
+            mediaProjection = null
+            if (projection != null) {
                 try {
-                    projection.stop()
+                    projection.unregisterCallback(projectionCallback)
                 } catch (_: Throwable) {
+                }
+                if (stopProjection) {
+                    try {
+                        projection.stop()
+                    } catch (_: Throwable) {
+                    }
                 }
             }
         }

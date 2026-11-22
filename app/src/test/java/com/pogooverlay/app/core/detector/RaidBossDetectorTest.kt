@@ -1,11 +1,13 @@
 package com.pogooverlay.app.core.detector
 
+import com.pogooverlay.app.core.data.OverlayMode
 import com.pogooverlay.app.core.data.PokemonNameMatcher
 import com.pogooverlay.app.core.data.PokemonSpecies
 import com.pogooverlay.app.core.data.RaidBossEntry
 import com.pogooverlay.app.core.ocr.OcrLine
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -107,29 +109,63 @@ class RaidBossDetectorTest {
     @Test
     fun detect_singleLineBossMatch_returnsExpectedSpecies() = runTest {
         val lines = listOf(
-            OcrLine(text = "RAYQUAZA", normalizedTop = 0.16f, normalizedLeft = 0.30f, normalizedHeight = 0.05f)
+            OcrLine(
+                text = "RAYQUAZA",
+                normalizedTop = 0.16f,
+                normalizedLeft = 0.30f,
+                normalizedHeight = 0.05f,
+                normalizedWidth = 0.40f
+            )
         )
 
-        val result = detector.detect(lines, isManualTrigger = false)
+        val result = detector.detect(lines)
         assertNotNull(result)
         assertEquals("rayquaza", result?.species?.speciesId)
         assertNull(result?.detectedPrefix)
     }
 
     @Test
-    fun detect_twoLineSplitMegaCharizardX_joinsLinesAndPreservesMegaForm() = runTest {
+    fun detectWithBox_twoLineSplitMegaCharizardX_joinsLinesAndComputesAccurateUnionBox() {
         val lines = listOf(
-            OcrLine(text = "CP 52341", normalizedTop = 0.09f, normalizedLeft = 0.35f, normalizedHeight = 0.04f),
-            OcrLine(text = "MEGA", normalizedTop = 0.15f, normalizedLeft = 0.42f, normalizedHeight = 0.04f),
-            OcrLine(text = "CHARIZARD X", normalizedTop = 0.20f, normalizedLeft = 0.28f, normalizedHeight = 0.05f),
-            OcrLine(text = "01:42", normalizedTop = 0.30f, normalizedLeft = 0.45f, normalizedHeight = 0.03f)
+            OcrLine(
+                text = "CP 52341",
+                normalizedTop = 0.09f,
+                normalizedLeft = 0.35f,
+                normalizedHeight = 0.04f,
+                normalizedWidth = 0.30f
+            ),
+            OcrLine(
+                text = "MEGA",
+                normalizedTop = 0.15f,
+                normalizedLeft = 0.42f,
+                normalizedHeight = 0.04f,
+                normalizedWidth = 0.16f
+            ),
+            OcrLine(
+                text = "CHARIZARD X",
+                normalizedTop = 0.20f,
+                normalizedLeft = 0.28f,
+                normalizedHeight = 0.05f,
+                normalizedWidth = 0.44f
+            ),
+            OcrLine(
+                text = "01:42",
+                normalizedTop = 0.30f,
+                normalizedLeft = 0.45f,
+                normalizedHeight = 0.03f,
+                normalizedWidth = 0.10f
+            )
         )
 
-        val result = detector.detect(lines, isManualTrigger = false)
+        val result = detector.detectWithBox(lines)
         assertNotNull(result)
-        assertEquals("charizard_mega_x", result?.species?.speciesId)
-        assertEquals(listOf("fire", "dragon"), result?.species?.types)
-        assertTrue((result?.alternateForms?.size ?: 0) >= 3)
+        assertEquals("charizard_mega_x", result!!.match.species.speciesId)
+        assertEquals(listOf("fire", "dragon"), result.match.species.types)
+        assertTrue(result.match.alternateForms.size >= 3)
+        assertEquals(0.15f, result.matchedLine.normalizedTop, 0.001f)
+        assertEquals(0.28f, result.matchedLine.normalizedLeft, 0.001f)
+        assertEquals(0.10f, result.matchedLine.normalizedHeight, 0.001f)
+        assertEquals(0.44f, result.matchedLine.normalizedWidth, 0.001f)
     }
 
     @Test
@@ -139,7 +175,7 @@ class RaidBossDetectorTest {
             OcrLine(text = "MEWTWO", normalizedTop = 0.19f, normalizedLeft = 0.32f, normalizedHeight = 0.05f)
         )
 
-        val shadowResult = detector.detect(shadowLines, isManualTrigger = false)
+        val shadowResult = detector.detect(shadowLines)
         assertNotNull(shadowResult)
         assertEquals("mewtwo", shadowResult?.species?.speciesId)
         assertEquals("Shadow", shadowResult?.detectedPrefix)
@@ -148,20 +184,46 @@ class RaidBossDetectorTest {
             OcrLine(text = "GIGANTAMAX GENGAR", normalizedTop = 0.16f, normalizedLeft = 0.22f, normalizedHeight = 0.05f)
         )
 
-        val gmaxResult = detector.detect(gigantamaxLines, isManualTrigger = false)
+        val gmaxResult = detector.detect(gigantamaxLines)
         assertNotNull(gmaxResult)
         assertEquals("gengar", gmaxResult?.species?.speciesId)
         assertEquals("Gigantamax", gmaxResult?.detectedPrefix)
     }
 
     @Test
-    fun detect_noiseLinesOnly_returnsNull() = runTest {
+    fun detect_ignoresTopGymNameAboveTopBandAndAboveCpLine() = runTest {
+        val linesWithTopGym = listOf(
+            OcrLine(text = "GENGAR STATUE GYM", normalizedTop = 0.07f, normalizedLeft = 0.25f, normalizedHeight = 0.03f),
+            OcrLine(text = "MEWTWO PARK", normalizedTop = 0.13f, normalizedLeft = 0.30f, normalizedHeight = 0.03f),
+            OcrLine(text = "CP 45468", normalizedTop = 0.15f, normalizedLeft = 0.35f, normalizedHeight = 0.04f),
+            OcrLine(text = "RAYQUAZA", normalizedTop = 0.22f, normalizedLeft = 0.28f, normalizedHeight = 0.06f),
+            OcrLine(text = "BATTLE", normalizedTop = 0.72f, normalizedLeft = 0.40f, normalizedHeight = 0.05f)
+        )
+
+        val result = detector.detect(linesWithTopGym)
+        assertNotNull(result)
+        assertEquals("rayquaza", result?.species?.speciesId)
+
+        val onlyTopGymLines = listOf(
+            OcrLine(text = "GENGAR STATUE GYM", normalizedTop = 0.07f, normalizedLeft = 0.25f, normalizedHeight = 0.03f),
+            OcrLine(text = "MEWTWO PARK", normalizedTop = 0.13f, normalizedLeft = 0.30f, normalizedHeight = 0.03f),
+            OcrLine(text = "CP 45468", normalizedTop = 0.15f, normalizedLeft = 0.35f, normalizedHeight = 0.04f),
+            OcrLine(text = "BATTLE", normalizedTop = 0.72f, normalizedLeft = 0.40f, normalizedHeight = 0.05f)
+        )
+        assertNull(detector.detect(onlyTopGymLines))
+    }
+
+    @Test
+    fun detect_noiseAndButtonLinesOnly_returnsNull() = runTest {
         val noiseLines = listOf(
             OcrLine(text = "CP 52341", normalizedTop = 0.10f, normalizedLeft = 0.30f, normalizedHeight = 0.04f),
             OcrLine(text = "01:42", normalizedTop = 0.18f, normalizedLeft = 0.45f, normalizedHeight = 0.03f),
             OcrLine(text = "BATTLE", normalizedTop = 0.50f, normalizedLeft = 0.40f, normalizedHeight = 0.05f),
             OcrLine(text = "READY", normalizedTop = 0.44f, normalizedLeft = 0.42f, normalizedHeight = 0.04f),
+            OcrLine(text = "REJOIN", normalizedTop = 0.44f, normalizedLeft = 0.42f, normalizedHeight = 0.04f),
             OcrLine(text = "PRIVATE GROUP", normalizedTop = 0.56f, normalizedLeft = 0.35f, normalizedHeight = 0.03f),
+            OcrLine(text = "RECOMMENDED PARTY", normalizedTop = 0.62f, normalizedLeft = 0.25f, normalizedHeight = 0.03f),
+            OcrLine(text = "BATTLE PARTY", normalizedTop = 0.66f, normalizedLeft = 0.30f, normalizedHeight = 0.03f),
             OcrLine(text = "INVITE", normalizedTop = 0.38f, normalizedLeft = 0.70f, normalizedHeight = 0.03f)
         )
 
@@ -169,49 +231,109 @@ class RaidBossDetectorTest {
             assertTrue("Expected noise line to be filtered: ${line.text}", detector.isNoiseLine(line.text))
         }
 
-        val result = detector.detect(noiseLines, isManualTrigger = false)
+        val result = detector.detect(noiseLines)
         assertNull(result)
     }
 
     @Test
-    fun detect_autoWatchDeduplicationAndResetAndManualOverride() = runTest {
-        val rayquazaLines = listOf(
-            OcrLine(text = "CP 45468", normalizedTop = 0.10f, normalizedLeft = 0.35f, normalizedHeight = 0.04f),
-            OcrLine(text = "RAYQUAZA", normalizedTop = 0.16f, normalizedLeft = 0.30f, normalizedHeight = 0.05f),
-            OcrLine(text = "BATTLE", normalizedTop = 0.52f, normalizedLeft = 0.40f, normalizedHeight = 0.05f)
+    fun raidScreenClassifier_distinguishesLobbyPreviewAndUnknown() {
+        val lobbyLines = listOf(
+            OcrLine(text = "01:45", normalizedTop = 0.12f, normalizedLeft = 0.45f, normalizedHeight = 0.03f),
+            OcrLine(text = "RECOMMENDED PARTY", normalizedTop = 0.55f, normalizedLeft = 0.25f, normalizedHeight = 0.03f),
+            OcrLine(text = "READY", normalizedTop = 0.75f, normalizedLeft = 0.38f, normalizedHeight = 0.04f),
+            OcrLine(text = "INVITE", normalizedTop = 0.45f, normalizedLeft = 0.72f, normalizedHeight = 0.03f)
+        )
+        assertEquals(RaidScreenType.RAID_LOBBY, RaidScreenClassifier.classify(lobbyLines))
+
+        val previewLines = listOf(
+            OcrLine(text = "CP 45468", normalizedTop = 0.15f, normalizedLeft = 0.35f, normalizedHeight = 0.04f),
+            OcrLine(text = "RAYQUAZA", normalizedTop = 0.22f, normalizedLeft = 0.30f, normalizedHeight = 0.05f),
+            OcrLine(text = "BATTLE", normalizedTop = 0.75f, normalizedLeft = 0.40f, normalizedHeight = 0.05f),
+            OcrLine(text = "PRIVATE GROUP", normalizedTop = 0.85f, normalizedLeft = 0.35f, normalizedHeight = 0.03f)
+        )
+        assertEquals(RaidScreenType.RAID_PREVIEW, RaidScreenClassifier.classify(previewLines))
+
+        val unknownLines = listOf(
+            OcrLine(text = "SETTINGS", normalizedTop = 0.20f, normalizedLeft = 0.40f, normalizedHeight = 0.04f)
+        )
+        assertEquals(RaidScreenType.UNKNOWN, RaidScreenClassifier.classify(unknownLines))
+    }
+
+    @Test
+    fun capturePipelineRouter_strictlyIsolatesRaidAndScanModes() = runTest {
+        var raidCalled = false
+        var scanCalled = false
+
+        val scanResult = CapturePipelineRouter.dispatch(
+            mode = OverlayMode.SCAN,
+            onRaid = {
+                raidCalled = true
+                "raid"
+            },
+            onScan = {
+                scanCalled = true
+                "scan"
+            }
+        )
+        assertFalse(raidCalled)
+        assertTrue(scanCalled)
+        assertEquals(CaptureRouteResult.Scan("scan"), scanResult)
+
+        raidCalled = false
+        scanCalled = false
+
+        val raidResult = CapturePipelineRouter.dispatch(
+            mode = OverlayMode.RAID,
+            onRaid = {
+                raidCalled = true
+                "raid"
+            },
+            onScan = {
+                scanCalled = true
+                "scan"
+            }
+        )
+        assertTrue(raidCalled)
+        assertFalse(scanCalled)
+        assertEquals(CaptureRouteResult.Raid("raid"), raidResult)
+    }
+
+    @Test
+    fun raidFlowCoordinator_cachesPreviewBossForLobbyAndPromptsWhenEmpty() {
+        val coordinator = RaidFlowCoordinator(detector)
+
+        val lobbyLines = listOf(
+            OcrLine(text = "MEWTWO", normalizedTop = 0.20f, normalizedLeft = 0.30f, normalizedHeight = 0.03f),
+            OcrLine(text = "RECOMMENDED PARTY", normalizedTop = 0.55f, normalizedLeft = 0.25f, normalizedHeight = 0.03f),
+            OcrLine(text = "READY", normalizedTop = 0.75f, normalizedLeft = 0.38f, normalizedHeight = 0.04f)
         )
 
-        // 1. First auto-watch pass detects Rayquaza
-        val firstAuto = detector.detect(rayquazaLines, isManualTrigger = false)
-        assertNotNull(firstAuto)
-        assertEquals("rayquaza", firstAuto?.species?.speciesId)
+        // Lobby without activeRaidBoss prompts user to scan Preview first
+        val promptAction = coordinator.handleCapturedLines(lobbyLines)
+        assertTrue(promptAction is RaidCaptureAction.PromptScanPreviewFirst)
+        assertNull(coordinator.activeRaidBoss)
 
-        // 2. Second auto-watch pass with same boss is deduplicated (returns null)
-        val secondAuto = detector.detect(rayquazaLines, isManualTrigger = false)
-        assertNull(secondAuto)
-
-        // 3. Manual 1-tap scan override always returns the match even when deduplicated
-        val manualOverride = detector.detect(rayquazaLines, isManualTrigger = true)
-        assertNotNull(manualOverride)
-        assertEquals("rayquaza", manualOverride?.species?.speciesId)
-
-        // 4. Subsequent auto-watch pass is still deduplicated until reset or boss changes
-        val thirdAuto = detector.detect(rayquazaLines, isManualTrigger = false)
-        assertNull(thirdAuto)
-
-        // 5. Resetting deduplication (e.g. on banner dismiss) allows auto-watch to emit again
-        detector.resetDeduplication()
-        val afterResetAuto = detector.detect(rayquazaLines, isManualTrigger = false)
-        assertNotNull(afterResetAuto)
-        assertEquals("rayquaza", afterResetAuto?.species?.speciesId)
-
-        // 6. Changing boss in auto-watch immediately emits the new boss
-        val mewtwoLines = listOf(
-            OcrLine(text = "SHADOW MEWTWO", normalizedTop = 0.16f, normalizedLeft = 0.28f, normalizedHeight = 0.05f)
+        // Preview scan detects Rayquaza and caches activeRaidBoss
+        val previewLines = listOf(
+            OcrLine(text = "CP 45468", normalizedTop = 0.14f, normalizedLeft = 0.35f, normalizedHeight = 0.04f),
+            OcrLine(text = "RAYQUAZA", normalizedTop = 0.22f, normalizedLeft = 0.28f, normalizedHeight = 0.05f),
+            OcrLine(text = "BATTLE", normalizedTop = 0.75f, normalizedLeft = 0.40f, normalizedHeight = 0.05f)
         )
-        val bossChangedAuto = detector.detect(mewtwoLines, isManualTrigger = false)
-        assertNotNull(bossChangedAuto)
-        assertEquals("mewtwo", bossChangedAuto?.species?.speciesId)
-        assertEquals("Shadow", bossChangedAuto?.detectedPrefix)
+        val previewAction = coordinator.handleCapturedLines(previewLines)
+        assertTrue(previewAction is RaidCaptureAction.ShowPreviewWeaknesses)
+        val detected = (previewAction as RaidCaptureAction.ShowPreviewWeaknesses).detection
+        assertEquals("rayquaza", detected.match.species.speciesId)
+        assertEquals("rayquaza", coordinator.activeRaidBoss?.species?.speciesId)
+
+        // Subsequent Lobby scan reuses cached Rayquaza instead of re-parsing lobby text ("MEWTWO")
+        val lobbyAction = coordinator.handleCapturedLines(lobbyLines)
+        assertTrue(lobbyAction is RaidCaptureAction.ShowLobbySuggestedParty)
+        val cachedBoss = (lobbyAction as RaidCaptureAction.ShowLobbySuggestedParty).cachedBoss
+        assertEquals("rayquaza", cachedBoss.species.speciesId)
+
+        // Clearing active boss resets to prompt on Lobby
+        coordinator.clearActiveBoss()
+        assertNull(coordinator.activeRaidBoss)
+        assertTrue(coordinator.handleCapturedLines(lobbyLines) is RaidCaptureAction.PromptScanPreviewFirst)
     }
 }
